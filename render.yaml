@@ -8,7 +8,6 @@ services:
     startCommand: python bot.py
 
     envVars:
-
       - key: TELEGRAM_TOKEN
         sync: false
 
@@ -22,10 +21,10 @@ services:
         sync: false
 
       - key: PRODUTOS_POR_CICLO
-        value: "5"
+        value: "1"
 
       - key: INTERVALO_MINUTOS
-        value: "30"
+        value: "5"
 
       - key: DESCONTO_MINIMO
         value: "30"
