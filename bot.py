@@ -21,7 +21,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 INTERVALO_MINUTOS = int(
-    os.getenv("INTERVALO_MINUTOS", "5")
+    os.getenv("INTERVALO_MINUTOS", "2")
 )
 
 PRODUTOS_POR_CICLO = int(
