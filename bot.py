@@ -10,8 +10,8 @@ from telegram import Bot
 
 
 # ============================================================
-# RAPOSA CAÇADORA
-# Shopee Affiliate -> Telegram
+# 🦊 RAPOSA CAÇADORA
+# Shopee Affiliate API -> Telegram
 # ============================================================
 
 
@@ -29,18 +29,14 @@ SHOPEE_API_URL = (
     "https://open-api.affiliate.shopee.com.br/graphql"
 )
 
-
-# Quantidade de produtos publicados por ciclo
 PRODUTOS_POR_CICLO = int(
     os.getenv("PRODUTOS_POR_CICLO", "5")
 )
 
-# Intervalo entre ciclos
 INTERVALO_MINUTOS = int(
     os.getenv("INTERVALO_MINUTOS", "30")
 )
 
-# Filtros
 DESCONTO_MINIMO = float(
     os.getenv("DESCONTO_MINIMO", "30")
 )
@@ -49,16 +45,14 @@ AVALIACAO_MINIMA = float(
     os.getenv("AVALIACAO_MINIMA", "4.5")
 )
 
-COMISSAO_MINIMA = float(
-    os.getenv("COMISSAO_MINIMA", "3")
-)
-
 VENDAS_MINIMAS = int(
     os.getenv("VENDAS_MINIMAS", "0")
 )
 
+COMISSAO_MINIMA = float(
+    os.getenv("COMISSAO_MINIMA", "0")
+)
 
-# Arquivo usado para evitar produtos repetidos
 ARQUIVO_ENVIADOS = Path(
     "produtos_enviados.json"
 )
@@ -70,7 +64,7 @@ ARQUIVO_ENVIADOS = Path(
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 
 logger = logging.getLogger(
@@ -79,7 +73,7 @@ logger = logging.getLogger(
 
 
 # ============================================================
-# VALIDAÇÃO
+# VALIDAR CONFIGURAÇÃO
 # ============================================================
 
 def validar_configuracao():
@@ -104,9 +98,13 @@ def validar_configuracao():
             + ", ".join(faltando)
         )
 
+    logger.info(
+        "Configuração validada."
+    )
+
 
 # ============================================================
-# CONVERSÃO NUMÉRICA
+# CONVERSÃO PARA NÚMERO
 # ============================================================
 
 def numero(valor):
@@ -115,12 +113,11 @@ def numero(valor):
         return float(valor)
 
     except (TypeError, ValueError):
-
         return 0.0
 
 
 # ============================================================
-# DINHEIRO
+# FORMATAÇÃO DE DINHEIRO
 # ============================================================
 
 def dinheiro(valor):
@@ -164,9 +161,7 @@ def gerar_assinatura(
 # REQUISIÇÃO GRAPHQL
 # ============================================================
 
-def shopee_graphql(
-    query
-):
+def shopee_graphql(query):
 
     timestamp = int(
         time.time()
@@ -176,9 +171,6 @@ def shopee_graphql(
         "query": query
     }
 
-    # IMPORTANTE:
-    # A assinatura precisa usar exatamente
-    # o mesmo payload enviado no POST.
     payload = json.dumps(
         body,
         ensure_ascii=False,
@@ -193,14 +185,17 @@ def shopee_graphql(
     headers = {
         "Content-Type": "application/json",
         "Authorization": (
-            "SHA256 "
-            f"Credential={SHOPEE_APP_ID}, "
+            f"SHA256 Credential={SHOPEE_APP_ID}, "
             f"Timestamp={timestamp}, "
             f"Signature={assinatura}"
-        ),
+        )
     }
 
-    response = requests.post(
+    logger.info(
+        "Consultando API da Shopee..."
+    )
+
+    resposta = requests.post(
         SHOPEE_API_URL,
         data=payload.encode("utf-8"),
         headers=headers,
@@ -208,33 +203,33 @@ def shopee_graphql(
     )
 
     logger.info(
-        "Shopee HTTP %s",
-        response.status_code
+        "Shopee respondeu HTTP %s",
+        resposta.status_code
     )
 
-    if response.status_code != 200:
+    if resposta.status_code != 200:
 
         raise RuntimeError(
             "Erro HTTP da Shopee: "
-            f"{response.status_code}\n"
-            f"{response.text[:1000]}"
+            f"{resposta.status_code}\n"
+            f"{resposta.text[:1000]}"
         )
 
     try:
 
-        resultado = response.json()
+        resultado = resposta.json()
 
     except ValueError:
 
         raise RuntimeError(
             "A Shopee não retornou JSON:\n"
-            + response.text[:1000]
+            + resposta.text[:1000]
         )
 
     if resultado.get("errors"):
 
         raise RuntimeError(
-            "Erro da API Shopee:\n"
+            "Erro retornado pela Shopee:\n"
             + json.dumps(
                 resultado["errors"],
                 ensure_ascii=False,
@@ -255,8 +250,7 @@ def buscar_ofertas():
     {
       productOfferV2(
         page: 1,
-        limit: 20,
-        sortType: 5
+        limit: 20
       ) {
         nodes {
           productName
@@ -292,10 +286,6 @@ def buscar_ofertas():
     }
     """
 
-    logger.info(
-        "Consultando ofertas da Shopee..."
-    )
-
     resultado = shopee_graphql(
         query
     )
@@ -329,7 +319,7 @@ def buscar_ofertas():
 
 
 # ============================================================
-# PREÇO ORIGINAL ESTIMADO
+# CALCULAR PREÇO ORIGINAL
 # ============================================================
 
 def calcular_preco_original(
@@ -343,10 +333,7 @@ def calcular_preco_original(
     if preco <= 0:
         return None
 
-    if desconto <= 0:
-        return None
-
-    if desconto >= 100:
+    if desconto <= 0 or desconto >= 100:
         return None
 
     return preco / (
@@ -355,138 +342,7 @@ def calcular_preco_original(
 
 
 # ============================================================
-# FILTRAR OFERTAS
-# ============================================================
-
-def filtrar_ofertas(
-    ofertas
-):
-
-    aprovadas = []
-
-    for produto in ofertas:
-
-        nome = produto.get(
-            "productName"
-        )
-
-        offer_link = produto.get(
-            "offerLink"
-        )
-
-        image_url = produto.get(
-            "imageUrl"
-        )
-
-        if not nome:
-            continue
-
-        if not offer_link:
-            continue
-
-        if not image_url:
-            continue
-
-        preco = numero(
-            produto.get("price")
-        )
-
-        desconto = numero(
-            produto.get(
-                "priceDiscountRate"
-            )
-        )
-
-        avaliacao = numero(
-            produto.get(
-                "ratingStar"
-            )
-        )
-
-        comissao = numero(
-            produto.get(
-                "commission"
-            )
-        )
-
-        vendas = int(
-            numero(
-                produto.get("sales")
-            )
-        )
-
-        # ----------------------------------------------------
-        # FILTROS
-        # ----------------------------------------------------
-
-        if preco <= 0:
-            continue
-
-        if desconto < DESCONTO_MINIMO:
-            continue
-
-        if avaliacao < AVALIACAO_MINIMA:
-            continue
-
-        if comissao < COMISSAO_MINIMA:
-            continue
-
-        if vendas < VENDAS_MINIMAS:
-            continue
-
-        aprovadas.append(
-            produto
-        )
-
-    # --------------------------------------------------------
-    # RANKING
-    # --------------------------------------------------------
-
-    def pontuacao(produto):
-
-        desconto = numero(
-            produto.get(
-                "priceDiscountRate"
-            )
-        )
-
-        avaliacao = numero(
-            produto.get(
-                "ratingStar"
-            )
-        )
-
-        vendas = numero(
-            produto.get(
-                "sales"
-            )
-        )
-
-        comissao = numero(
-            produto.get(
-                "commission"
-            )
-        )
-
-        # Peso maior para desconto,
-        # avaliação e vendas.
-        return (
-            desconto * 3
-            + avaliacao * 10
-            + min(vendas, 10000) / 100
-            + comissao
-        )
-
-    aprovadas.sort(
-        key=pontuacao,
-        reverse=True
-    )
-
-    return aprovadas
-
-
-# ============================================================
-# ARQUIVO DE PRODUTOS ENVIADOS
+# CARREGAR PRODUTOS JÁ ENVIADOS
 # ============================================================
 
 def carregar_enviados():
@@ -515,16 +371,18 @@ def carregar_enviados():
     except Exception as erro:
 
         logger.warning(
-            "Não consegui ler produtos_enviados.json: %s",
+            "Erro lendo produtos_enviados.json: %s",
             erro
         )
 
         return set()
 
 
-def salvar_enviados(
-    enviados
-):
+# ============================================================
+# SALVAR PRODUTOS ENVIADOS
+# ============================================================
+
+def salvar_enviados(enviados):
 
     with open(
         ARQUIVO_ENVIADOS,
@@ -541,99 +399,150 @@ def salvar_enviados(
 
 
 # ============================================================
-# TEXTO DA PUBLICAÇÃO
+# FILTRAR E RANQUEAR PRODUTOS
 # ============================================================
 
-def montar_mensagem(
-    produto
-):
+def filtrar_ofertas(ofertas):
 
-    nome = produto.get(
-        "productName",
-        "Produto"
-    )
+    aprovadas = []
 
-    preco = numero(
-        produto.get("price")
-    )
+    for produto in ofertas:
 
-    desconto = numero(
-        produto.get(
-            "priceDiscountRate"
+        nome = produto.get(
+            "productName"
         )
-    )
 
-    avaliacao = numero(
-        produto.get(
-            "ratingStar"
+        image_url = produto.get(
+            "imageUrl"
         )
-    )
 
-    vendas = int(
-        numero(
+        offer_link = produto.get(
+            "offerLink"
+        )
+
+        if not nome:
+            continue
+
+        if not image_url:
+            continue
+
+        if not offer_link:
+            continue
+
+        preco = numero(
+            produto.get("price")
+        )
+
+        desconto = numero(
+            produto.get(
+                "priceDiscountRate"
+            )
+        )
+
+        avaliacao = numero(
+            produto.get(
+                "ratingStar"
+            )
+        )
+
+        vendas = int(
+            numero(
+                produto.get("sales")
+            )
+        )
+
+        comissao = numero(
+            produto.get("commission")
+        )
+
+        if preco <= 0:
+            continue
+
+        if desconto < DESCONTO_MINIMO:
+            continue
+
+        if avaliacao < AVALIACAO_MINIMA:
+            continue
+
+        if vendas < VENDAS_MINIMAS:
+            continue
+
+        if comissao < COMISSAO_MINIMA:
+            continue
+
+        aprovadas.append(
+            produto
+        )
+
+    # --------------------------------------------------------
+    # RANKING
+    # --------------------------------------------------------
+
+    def pontuacao(produto):
+
+        desconto = numero(
+            produto.get(
+                "priceDiscountRate"
+            )
+        )
+
+        avaliacao = numero(
+            produto.get(
+                "ratingStar"
+            )
+        )
+
+        vendas = numero(
             produto.get("sales")
         )
-    )
 
-    loja = produto.get(
-        "shopName",
-        "Shopee"
-    )
-
-    comissao = numero(
-        produto.get(
-            "commission"
+        comissao = numero(
+            produto.get("commission")
         )
+
+        return (
+            desconto * 3
+            + avaliacao * 10
+            + min(vendas, 10000) / 100
+            + comissao
+        )
+
+    aprovadas.sort(
+        key=pontuacao,
+        reverse=True
     )
+
+    logger.info(
+        "%d produtos passaram nos filtros.",
+        len(aprovadas)
+    )
+
+    return aprovadas
+
+
+# ============================================================
+# ID ÚNICO DO PRODUTO
+# ============================================================
+
+def obter_id_produto(produto):
+
+    shop_id = produto.get(
+        "shopId"
+    )
+
+    item_id = produto.get(
+        "itemId"
+    )
+
+    if shop_id and item_id:
+
+        return f"{shop_id}:{item_id}"
 
     offer_link = produto.get(
         "offerLink"
     )
 
-    preco_original = (
-        calcular_preco_original(
-            preco,
-            desconto
-        )
-    )
-
-    if preco_original:
-
-        preco_linha = (
-            f"❌ De: ~{dinheiro(preco_original)}~\n"
-            f"✅ Por: *{dinheiro(preco)}*"
-        )
-
-    else:
-
-        preco_linha = (
-            f"✅ Por: *{dinheiro(preco)}*"
-        )
-
-    # Telegram MarkdownV2 é mais chato com
-    # caracteres especiais. Para evitar problemas,
-    # usamos HTML.
-    mensagem = (
-        "🦊 <b>RAPOSA CAÇADORA</b>\n\n"
-
-        f"🔥 <b>{nome}</b>\n\n"
-
-        f"{preco_linha}\n\n"
-
-        f"🏷️ <b>{desconto:.0f}% OFF</b>\n"
-        f"⭐ Avaliação: <b>{avaliacao:.1f}</b>\n"
-        f"🛍️ Loja: {loja}\n"
-        f"📦 Vendas: {vendas:,}\n"
-        f"💰 Comissão estimada: "
-        f"<b>{dinheiro(comissao)}</b>\n\n"
-
-        f"🛒 <b>COMPRE AQUI:</b>\n"
-        f"{offer_link}\n\n"
-
-        "⚡ <i>Aproveite enquanto estiver disponível!</i>"
-    )
-
-    return mensagem
+    return offer_link
 
 
 # ============================================================
@@ -654,12 +563,10 @@ def escapar_html(texto):
 
 
 # ============================================================
-# TEXTO SEGURO
+# MONTAR PUBLICAÇÃO
 # ============================================================
 
-def montar_mensagem_segura(
-    produto
-):
+def montar_mensagem(produto):
 
     nome = escapar_html(
         produto.get(
@@ -717,29 +624,33 @@ def montar_mensagem_segura(
 
     if preco_original:
 
-        preco_linha = (
-            f"❌ De: <s>{dinheiro(preco_original)}</s>\n"
-            f"✅ Por: <b>{dinheiro(preco)}</b>"
+        preco_texto = (
+            f"❌ De: "
+            f"<s>{dinheiro(preco_original)}</s>\n"
+            f"✅ Por: "
+            f"<b>{dinheiro(preco)}</b>"
         )
 
     else:
 
-        preco_linha = (
-            f"✅ Por: <b>{dinheiro(preco)}</b>"
+        preco_texto = (
+            f"✅ Por: "
+            f"<b>{dinheiro(preco)}</b>"
         )
 
-    mensagem = (
+    return (
         "🦊 <b>RAPOSA CAÇADORA</b>\n\n"
 
         f"🔥 <b>{nome}</b>\n\n"
 
-        f"{preco_linha}\n\n"
+        f"{preco_texto}\n\n"
 
         f"🏷️ <b>{desconto:.0f}% OFF</b>\n"
         f"⭐ Avaliação: <b>{avaliacao:.1f}</b>\n"
         f"🛍️ Loja: {loja}\n"
         f"📦 Vendas: <b>{vendas:,}</b>\n"
-        f"💰 Comissão: <b>{dinheiro(comissao)}</b>\n\n"
+        f"💰 Comissão: "
+        f"<b>{dinheiro(comissao)}</b>\n\n"
 
         "🛒 <b>COMPRE AQUI:</b>\n"
         f"{offer_link}\n\n"
@@ -747,11 +658,9 @@ def montar_mensagem_segura(
         "⚡ <i>Aproveite enquanto estiver disponível!</i>"
     )
 
-    return mensagem
-
 
 # ============================================================
-# PUBLICAR NO TELEGRAM
+# PUBLICAR PRODUTO
 # ============================================================
 
 def publicar_produto(
@@ -759,7 +668,7 @@ def publicar_produto(
     produto
 ):
 
-    mensagem = montar_mensagem_segura(
+    mensagem = montar_mensagem(
         produto
     )
 
@@ -781,46 +690,18 @@ def publicar_produto(
         bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=mensagem,
-            parse_mode="HTML",
-            disable_web_page_preview=False
-        )
-
-
-# ============================================================
-# ID ÚNICO
-# ============================================================
-
-def obter_id_produto(
-    produto
-):
-
-    item_id = produto.get(
-        "itemId"
-    )
-
-    shop_id = produto.get(
-        "shopId"
-    )
-
-    if item_id:
-
-        return f"{shop_id}:{item_id}"
-
-    return produto.get(
-        "offerLink"
-    )
+            parse_mode="HTML"
+            )
 
 
 # ============================================================
 # EXECUTAR UM CICLO
 # ============================================================
 
-def executar_ciclo(
-    bot
-):
+def executar_ciclo(bot):
 
     logger.info(
-        "======================================"
+        "=========================================="
     )
 
     logger.info(
@@ -831,18 +712,13 @@ def executar_ciclo(
 
     ofertas = buscar_ofertas()
 
-    aprovadas = filtrar_ofertas(
+    ofertas = filtrar_ofertas(
         ofertas
-    )
-
-    logger.info(
-        "%d ofertas aprovadas após filtros.",
-        len(aprovadas)
     )
 
     publicados = 0
 
-    for produto in aprovadas:
+    for produto in ofertas:
 
         if publicados >= PRODUTOS_POR_CICLO:
             break
@@ -854,10 +730,14 @@ def executar_ciclo(
         if not produto_id:
             continue
 
-        if str(produto_id) in enviados:
+        produto_id = str(
+            produto_id
+        )
+
+        if produto_id in enviados:
 
             logger.info(
-                "Já enviado: %s",
+                "Produto já enviado: %s",
                 produto_id
             )
 
@@ -878,7 +758,7 @@ def executar_ciclo(
             )
 
             enviados.add(
-                str(produto_id)
+                produto_id
             )
 
             salvar_enviados(
@@ -887,8 +767,6 @@ def executar_ciclo(
 
             publicados += 1
 
-            # Evita mandar várias mensagens
-            # praticamente ao mesmo tempo.
             time.sleep(3)
 
         except Exception as erro:
@@ -899,13 +777,13 @@ def executar_ciclo(
             )
 
     logger.info(
-        "Ciclo finalizado: %d publicados.",
+        "Ciclo finalizado. %d produtos publicados.",
         publicados
     )
 
 
 # ============================================================
-# LOOP PRINCIPAL
+# FUNÇÃO PRINCIPAL
 # ============================================================
 
 def main():
@@ -946,7 +824,7 @@ def main():
 
 
 # ============================================================
-# START
+# INICIAR
 # ============================================================
 
 if __name__ == "__main__":
