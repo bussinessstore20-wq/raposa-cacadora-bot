@@ -1,53 +1,23 @@
 import hashlib
-import hmac
 import json
 import logging
 import os
 import time
-from typing import Any
 
 import requests
 
 
-logger = logging.getLogger(
-    "raposa-cacadora"
-)
+logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# CONFIGURAÇÃO
-# ============================================================
-
-SHOPEE_APP_ID = os.getenv(
-    "SHOPEE_APP_ID",
-    ""
-).strip()
-
-SHOPEE_SECRET = os.getenv(
-    "SHOPEE_SECRET",
-    ""
-).strip()
 
 SHOPEE_GRAPHQL_URL = os.getenv(
     "SHOPEE_GRAPHQL_URL",
-    "https://open-api.affiliate.shopee.com.br/graphql"
-).strip()
+    "https://open-api.affiliate.shopee.com.br/graphql",
+)
 
-
-# ============================================================
-# ERRO
-# ============================================================
-
-class ShopeeAPIError(Exception):
-    pass
-
-
-# ============================================================
-# QUERY PRODUCT OFFER V2
-# ============================================================
 
 PRODUCT_OFFER_QUERY = """
-query {
+{
     productOfferV2 {
         nodes {
             productName
@@ -72,7 +42,6 @@ query {
             sellerCommissionRate
             shopeeCommissionRate
         }
-
         pageInfo {
             page
             limit
@@ -84,208 +53,171 @@ query {
 """
 
 
-# ============================================================
-# ASSINATURA SHOPEE
-# ============================================================
+class ShopeeAPIError(Exception):
+    """Erro relacionado à API de Afiliados da Shopee."""
 
-def gerar_assinatura(
-    payload: str
-) -> str:
 
-    if not SHOPEE_APP_ID:
+def _obter_credenciais():
+    app_id = os.getenv("SHOPEE_APP_ID")
+    secret = os.getenv("SHOPEE_SECRET")
+
+    if not app_id:
         raise ShopeeAPIError(
-            "SHOPEE_APP_ID não configurado."
+            "A variável SHOPEE_APP_ID não está configurada."
         )
 
-    if not SHOPEE_SECRET:
+    if not secret:
         raise ShopeeAPIError(
-            "SHOPEE_SECRET não configurado."
+            "A variável SHOPEE_SECRET não está configurada."
         )
 
-    timestamp = int(
-        time.time()
-    )
-
-    base_string = (
-        SHOPEE_APP_ID
-        + str(timestamp)
-        + payload
-    )
-
-    assinatura = hmac.new(
-        SHOPEE_SECRET.encode(
-            "utf-8"
-        ),
-        base_string.encode(
-            "utf-8"
-        ),
-        hashlib.sha256
-    ).hexdigest()
-
-    return (
-        f"SHA256 Credential={SHOPEE_APP_ID},"
-        f"Timestamp={timestamp},"
-        f"Signature={assinatura}"
-    )
+    return app_id.strip(), secret.strip()
 
 
-# ============================================================
-# CONSULTA GRAPHQL
-# ============================================================
+def _criar_payload():
+    """
+    Cria exatamente o JSON que será enviado à Shopee.
 
-def consultar_shopee():
+    A assinatura deve ser calculada sobre o payload exato
+    enviado no corpo da requisição.
+    """
 
-    payload_dict = {
-        "query": PRODUCT_OFFER_QUERY
+    payload = {
+        "query": PRODUCT_OFFER_QUERY,
+        "variables": {},
     }
 
-    payload = json.dumps(
-        payload_dict,
-        separators=(
-            ",",
-            ":"
-        ),
-        ensure_ascii=False
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
 
-    authorization = gerar_assinatura(
-        payload
+
+def _gerar_assinatura(app_id, secret, timestamp, payload):
+    """
+    Gera a assinatura da Shopee:
+
+    SHA256(AppId + Timestamp + Payload + Secret)
+    """
+
+    texto_assinatura = (
+        f"{app_id}{timestamp}{payload}{secret}"
+    )
+
+    assinatura = hashlib.sha256(
+        texto_assinatura.encode("utf-8")
+    ).hexdigest()
+
+    return assinatura
+
+
+def _consultar_api():
+    app_id, secret = _obter_credenciais()
+
+    payload = _criar_payload()
+
+    timestamp = int(time.time())
+
+    assinatura = _gerar_assinatura(
+        app_id=app_id,
+        secret=secret,
+        timestamp=timestamp,
+        payload=payload,
+    )
+
+    authorization = (
+        f"SHA256 Credential={app_id}, "
+        f"Timestamp={timestamp}, "
+        f"Signature={assinatura}"
     )
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": authorization
+        "Accept": "application/json",
+        "Authorization": authorization,
     }
 
+    logger.info("Consultando API da Shopee...")
+
     try:
-
-        resposta = requests.post(
+        response = requests.post(
             SHOPEE_GRAPHQL_URL,
+            data=payload.encode("utf-8"),
             headers=headers,
-            data=payload.encode(
-                "utf-8"
-            ),
-            timeout=30
+            timeout=30,
         )
-
-    except requests.RequestException as erro:
-
+    except requests.RequestException as exc:
         raise ShopeeAPIError(
-            f"Erro de conexão com a Shopee: {erro}"
-        ) from erro
+            f"Erro de conexão com a Shopee: {exc}"
+        ) from exc
 
     logger.info(
         "Shopee respondeu HTTP %s",
-        resposta.status_code
+        response.status_code,
     )
 
-    if resposta.status_code != 200:
-
+    if response.status_code != 200:
         raise ShopeeAPIError(
-            "Shopee respondeu HTTP "
-            f"{resposta.status_code}: "
-            f"{resposta.text[:1000]}"
+            f"Shopee respondeu HTTP {response.status_code}: "
+            f"{response.text[:1000]}"
         )
 
     try:
+        resultado = response.json()
+    except ValueError as exc:
+        raise ShopeeAPIError(
+            "A Shopee retornou uma resposta que não é JSON."
+        ) from exc
 
-        dados = resposta.json()
+    if resultado.get("errors"):
+        erros = resultado["errors"]
 
-    except ValueError as erro:
+        logger.error(
+            "Erro GraphQL da Shopee: %s",
+            json.dumps(
+                erros,
+                ensure_ascii=False,
+            ),
+        )
 
         raise ShopeeAPIError(
-            "Resposta da Shopee não é JSON válido."
-        ) from erro
-
-    if dados.get("errors"):
-
-        raise ShopeeAPIError(
-            "Erro retornado pela Shopee: "
+            "A API da Shopee retornou erros GraphQL: "
             + json.dumps(
-                dados["errors"],
-                ensure_ascii=False
+                erros,
+                ensure_ascii=False,
             )
         )
 
-    return dados
+    return resultado
 
-
-# ============================================================
-# BUSCAR OFERTAS
-# ============================================================
 
 def buscar_ofertas():
+    """
+    Consulta a API da Shopee e retorna a lista de ofertas.
 
-    dados = consultar_shopee()
+    Retorno:
+        list[dict]
+    """
 
-    try:
+    resultado = _consultar_api()
 
-        product_offer = (
-            dados
-            .get("data", {})
-            .get("productOfferV2", {})
-        )
+    data = resultado.get("data") or {}
 
-        ofertas = product_offer.get(
-            "nodes",
-            []
-        )
+    product_offer = data.get("productOfferV2") or {}
 
-    except AttributeError as erro:
+    ofertas = product_offer.get("nodes") or []
 
-        raise ShopeeAPIError(
-            "Formato inesperado na resposta "
-            "da API da Shopee."
-        ) from erro
-
-    if not isinstance(
-        ofertas,
-        list
-    ):
-
-        raise ShopeeAPIError(
-            "A Shopee não retornou uma lista "
-            "de ofertas."
-        )
+    page_info = product_offer.get("pageInfo") or {}
 
     logger.info(
-        "%d ofertas recebidas.",
-        len(ofertas)
+        "%s ofertas recebidas.",
+        len(ofertas),
+    )
+
+    logger.debug(
+        "PageInfo da Shopee: %s",
+        page_info,
     )
 
     return ofertas
-
-
-# ============================================================
-# TESTE DIRETO
-# ============================================================
-
-if __name__ == "__main__":
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format=(
-            "%(asctime)s | "
-            "%(levelname)s | "
-            "%(message)s"
-        )
-    )
-
-    try:
-
-        ofertas = buscar_ofertas()
-
-        print(
-            json.dumps(
-                ofertas,
-                ensure_ascii=False,
-                indent=2
-            )
-        )
-
-    except Exception as erro:
-
-        logger.exception(
-            "Erro ao consultar Shopee: %s",
-            erro
-        )
