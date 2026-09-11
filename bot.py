@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import sqlite3
 import logging
 from urllib.parse import urlparse
@@ -9,6 +10,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -18,6 +20,12 @@ from telegram.ext import (
     filters,
 )
 
+from shopee import (
+    get_product_from_shopee,
+    ShopeeAPIError,
+)
+
+
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
@@ -25,20 +33,83 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 
+# Opcional:
+# coloque os IDs dos usuários autorizados separados por vírgula.
+#
+# Exemplo:
+# ADMIN_IDS=123456789,987654321
+#
+# Se deixar vazio, qualquer pessoa que encontrar o bot poderá
+# tentar usar.
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
+
+
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN não configurado.")
+    raise RuntimeError(
+        "ERRO: BOT_TOKEN não foi configurado."
+    )
+
 
 if not CHANNEL_ID:
-    raise RuntimeError("CHANNEL_ID não configurado.")
+    raise RuntimeError(
+        "ERRO: CHANNEL_ID não foi configurado."
+    )
 
+
+# Converte:
+# "123,456,789"
+#
+# para:
+# {123, 456, 789}
+def load_admin_ids():
+
+    if not ADMIN_IDS_RAW.strip():
+        return set()
+
+    ids = set()
+
+    for value in ADMIN_IDS_RAW.split(","):
+
+        value = value.strip()
+
+        if not value:
+            continue
+
+        try:
+            ids.add(int(value))
+        except ValueError:
+            logging.warning(
+                "ADMIN_IDS contém valor inválido: %s",
+                value
+            )
+
+    return ids
+
+
+ADMIN_IDS = load_admin_ids()
+
+
+# Banco SQLite
 DB_FILE = "raposa.db"
 
+
+# ============================================================
+# LOG
+# ============================================================
+
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
 )
 
-logger = logging.getLogger("raposa-cacadora")
+logger = logging.getLogger(
+    "raposa-cacadora"
+)
 
 
 # ============================================================
@@ -46,31 +117,51 @@ logger = logging.getLogger("raposa-cacadora")
 # ============================================================
 
 def init_db():
+
     conn = sqlite3.connect(DB_FILE)
+
     cursor = conn.cursor()
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+
             url TEXT UNIQUE NOT NULL,
+
+            original_url TEXT,
+
             title TEXT,
+
             old_price TEXT,
+
             price TEXT,
+
             image_url TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+            affiliate_link TEXT,
+
+            created_at TIMESTAMP
+                DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
     conn.commit()
+
     conn.close()
 
 
 def product_exists(url):
+
     conn = sqlite3.connect(DB_FILE)
+
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT id FROM products WHERE url = ?",
+        """
+        SELECT id
+        FROM products
+        WHERE url = ?
+        """,
         (url,)
     )
 
@@ -82,148 +173,296 @@ def product_exists(url):
 
 
 def save_product(product):
+
     conn = sqlite3.connect(DB_FILE)
+
     cursor = conn.cursor()
 
-    cursor.execute("""
+    cursor.execute(
+        """
         INSERT OR IGNORE INTO products
-        (url, title, old_price, price, image_url)
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        product["url"],
-        product["title"],
-        product["old_price"],
-        product["price"],
-        product["image_url"],
-    ))
+        (
+            url,
+            original_url,
+            title,
+            old_price,
+            price,
+            image_url,
+            affiliate_link
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            product.get("url"),
+            product.get("original_url"),
+            product.get("title"),
+            product.get("old_price"),
+            product.get("price"),
+            product.get("image_url"),
+            product.get("affiliate_link"),
+        )
+    )
 
     conn.commit()
+
     conn.close()
 
 
 # ============================================================
-# UTILIDADES
+# AUTORIZAÇÃO
 # ============================================================
 
-def is_shopee_url(text):
-    try:
-        parsed = urlparse(text)
+def user_is_authorized(update: Update):
 
-        domain = parsed.netloc.lower()
+    # Se ADMIN_IDS não foi configurado,
+    # não bloqueia ninguém.
+    if not ADMIN_IDS:
+        return True
 
-        return (
-            "shopee.com.br" in domain
-            or "shopee.com" in domain
-        )
+    user = update.effective_user
 
-    except Exception:
+    if not user:
         return False
 
+    return user.id in ADMIN_IDS
+
+
+async def authorization_error(update: Update):
+
+    message = (
+        "🔒 <b>Acesso restrito.</b>\n\n"
+        "Você não possui autorização para "
+        "usar a Raposa Caçadora."
+    )
+
+    if update.callback_query:
+
+        await update.callback_query.answer(
+            "Acesso negado.",
+            show_alert=True
+        )
+
+    elif update.message:
+
+        await update.message.reply_text(
+            message,
+            parse_mode="HTML"
+        )
+
+
+# ============================================================
+# URL
+# ============================================================
 
 def extract_url(text):
+
+    if not text:
+        return None
+
     match = re.search(
-        r"https?://[^\s]+",
+        r"https?://[^\s<>]+",
         text
     )
 
     if not match:
         return None
 
-    return match.group(0).rstrip(".,)")
+    url = match.group(0)
+
+    # Remove pontuação que possa ter vindo
+    # junto com o link.
+    url = url.rstrip(
+        ".,;:!?)]}>\"'"
+    )
+
+    return url
+
+
+def is_shopee_url(url):
+
+    try:
+
+        parsed = urlparse(url)
+
+        domain = parsed.netloc.lower()
+
+        # Aceita:
+        #
+        # shopee.com.br
+        # www.shopee.com.br
+        # s.shopee.com.br
+        #
+        # e outros subdomínios da Shopee.
+
+        return (
+            domain == "shopee.com.br"
+            or domain.endswith(".shopee.com.br")
+            or domain == "shopee.com"
+            or domain.endswith(".shopee.com")
+        )
+
+    except Exception:
+
+        return False
 
 
 # ============================================================
-# PRODUTO
+# FORMATAÇÃO
 # ============================================================
 
-async def get_product_from_shopee(url):
-    """
-    V1:
+def clean_text(value):
 
-    Aqui ficará o módulo responsável por obter os dados reais
-    do produto da Shopee.
+    if value is None:
+        return ""
 
-    Por enquanto usamos dados de demonstração para testar
-    TODO o fluxo do Telegram.
-
-    Depois substituímos somente esta função pela integração
-    escolhida para obter os dados da Shopee.
-    """
-
-    return {
-        "url": url,
-        "title": "Conjunto Alfaiataria Calça e Colete Feminino Cintura Alta Elegante Social",
-        "old_price": "R$ 89,99",
-        "price": "R$ 85,50",
-        "image_url": None,
-    }
+    return str(value).strip()
 
 
-# ============================================================
-# MENSAGEM
-# ============================================================
+def safe_html(value):
+
+    return html.escape(
+        clean_text(value)
+    )
+
 
 def create_caption(product):
 
-    return f"""🛍️ <b>{product['title']}</b>
+    title = safe_html(
+        product.get(
+            "title",
+            "Produto Shopee"
+        )
+    )
 
-❌ De: <s>{product['old_price']}</s>
-✅ <b>Por: {product['price']} no Pix</b>
+    old_price = safe_html(
+        product.get(
+            "old_price",
+            ""
+        )
+    )
 
-🔥 <b>ACHADINHO ENCONTRADO!</b>
+    price = safe_html(
+        product.get(
+            "price",
+            ""
+        )
+    )
 
-🦊 <b>Raposa Caçadora</b>"""
+    # Monta o preço antigo somente
+    # se ele existir.
+    old_price_line = ""
+
+    if old_price:
+
+        old_price_line = (
+            f"❌ De: <s>{old_price}</s>\n"
+        )
+
+    # Se houver preço atual.
+    price_line = ""
+
+    if price:
+
+        price_line = (
+            f"✅ <b>Por: {price} no Pix</b>\n"
+        )
+
+    caption = (
+        f"🛍️ <b>{title}</b>\n\n"
+        f"{old_price_line}"
+        f"{price_line}\n"
+        f"🔥 <b>ACHADINHO ENCONTRADO!</b>\n\n"
+        f"🦊 <b>Raposa Caçadora</b>"
+    )
+
+    return caption
 
 
-def create_buy_button(url):
+# ============================================================
+# BOTÕES
+# ============================================================
+
+def create_confirmation_keyboard():
 
     keyboard = [
+
+        [
+            InlineKeyboardButton(
+                "✅ PUBLICAR",
+                callback_data="publish"
+            ),
+
+            InlineKeyboardButton(
+                "❌ CANCELAR",
+                callback_data="cancel"
+            ),
+        ]
+
+    ]
+
+    return InlineKeyboardMarkup(
+        keyboard
+    )
+
+
+def create_buy_keyboard(url):
+
+    keyboard = [
+
         [
             InlineKeyboardButton(
                 "🛒 COMPRAR NA SHOPEE",
                 url=url
             )
         ]
+
     ]
 
-    return InlineKeyboardMarkup(keyboard)
-
-
-def create_confirmation_buttons():
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "✅ PUBLICAR",
-                callback_data="publish"
-            ),
-            InlineKeyboardButton(
-                "❌ CANCELAR",
-                callback_data="cancel"
-            ),
-        ]
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(
+        keyboard
+    )
 
 
 # ============================================================
-# /start
+# /START
 # ============================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    message = """🦊 <b>Raposa Caçadora</b>
+    if not user_is_authorized(update):
+
+        await authorization_error(update)
+
+        return
+
+    message = """
+🦊 <b>RAPOSA CAÇADORA</b>
 
 Olá! 👋
 
-Envie um link da Shopee e eu preparo o achadinho para você.
+Eu sou seu bot de achadinhos da Shopee.
 
-🔗 <b>Exemplo:</b>
+🔗 <b>Como usar:</b>
 
-https://s.shopee.com.br/SEU-LINK
+Basta enviar um link da Shopee aqui.
 
-Depois eu mostro uma prévia e você decide se quer publicar no canal."""
+Exemplo:
+
+<code>https://s.shopee.com.br/SEU-LINK</code>
+
+Eu vou:
+
+1️⃣ Encontrar o produto
+2️⃣ Pegar os dados
+3️⃣ Montar o anúncio
+4️⃣ Mostrar uma prévia
+5️⃣ Você decide se publica
+
+🛒 Depois é só clicar em <b>PUBLICAR</b>.
+"""
 
     await update.message.reply_text(
         message,
@@ -232,23 +471,38 @@ Depois eu mostro uma prévia e você decide se quer publicar no canal."""
 
 
 # ============================================================
-# /help
+# /HELP
 # ============================================================
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    message = """🦊 <b>Raposa Caçadora</b>
+    if not user_is_authorized(update):
 
-<b>Comandos:</b>
+        await authorization_error(update)
+
+        return
+
+    message = """
+🦊 <b>RAPOSA CAÇADORA</b>
+
+<b>Comandos disponíveis:</b>
 
 /start - iniciar o bot
-/help - ajuda
+/help - mostrar ajuda
 
-<b>Como usar:</b>
+<b>Uso:</b>
 
-Basta enviar um link da Shopee.
+Envie um link da Shopee.
 
-A Raposa Caçadora irá preparar a publicação para você."""
+Exemplo:
+
+<code>https://s.shopee.com.br/AAH3wuxvT6</code>
+
+A Raposa irá preparar a oferta.
+"""
 
     await update.message.reply_text(
         message,
@@ -260,9 +514,19 @@ A Raposa Caçadora irá preparar a publicação para você."""
 # RECEBER LINK
 # ============================================================
 
-async def receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_link(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not user_is_authorized(update):
+
+        await authorization_error(update)
+
+        return
 
     if not update.message:
+
         return
 
     text = update.message.text or ""
@@ -270,67 +534,170 @@ async def receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = extract_url(text)
 
     if not url:
+
         await update.message.reply_text(
-            "🦊 Não encontrei nenhum link na mensagem.\n\n"
-            "Envie um link da Shopee."
+            "🦊 <b>Não encontrei um link.</b>\n\n"
+            "Envie um link da Shopee.",
+            parse_mode="HTML"
         )
+
         return
 
     if not is_shopee_url(url):
+
         await update.message.reply_text(
-            "⚠️ Esse link não parece ser da Shopee.\n\n"
-            "Envie um link da Shopee."
+            "⚠️ <b>Esse não parece ser um link da Shopee.</b>\n\n"
+            "Envie um link da Shopee.",
+            parse_mode="HTML"
         )
+
         return
 
+    # Verifica se já foi publicado.
     if product_exists(url):
 
         await update.message.reply_text(
-            "⚠️ Esse produto já foi processado anteriormente."
+            "⚠️ <b>Esse produto já foi publicado.</b>\n\n"
+            "Não vou publicar o mesmo produto novamente.",
+            parse_mode="HTML"
         )
 
         return
 
-    await update.message.reply_text(
-        "🦊 <b>Caçando o produto...</b> 🔎",
+    # Mensagem de processamento.
+    processing_message = await update.message.reply_text(
+        "🦊 <b>A Raposa está caçando...</b> 🔎\n\n"
+        "Aguarde um momento.",
         parse_mode="HTML"
     )
 
     try:
 
-        product = await get_product_from_shopee(url)
+        # Consulta o módulo da Shopee.
+        product = await get_product_from_shopee(
+            url
+        )
 
-        context.user_data["pending_product"] = product
+        if not product:
 
-        caption = create_caption(product)
-
-        keyboard = create_confirmation_buttons()
-
-        if product.get("image_url"):
-
-            await update.message.reply_photo(
-                photo=product["image_url"],
-                caption=caption,
-                parse_mode="HTML",
-                reply_markup=keyboard
+            raise Exception(
+                "A API não retornou dados do produto."
             )
 
-        else:
+        # Garante que a URL original
+        # fique registrada.
+        product["original_url"] = url
 
-            await update.message.reply_text(
-                caption,
-                parse_mode="HTML",
-                reply_markup=keyboard
+        # Se o módulo não colocou "url",
+        # usamos o link original.
+        if not product.get("url"):
+
+            product["url"] = (
+                product.get("affiliate_link")
+                or url
             )
 
-    except Exception as e:
+        # Guarda temporariamente a oferta
+        # para o botão PUBLICAR.
+        context.user_data[
+            "pending_product"
+        ] = product
 
-        logger.exception(e)
+        caption = create_caption(
+            product
+        )
+
+        keyboard = (
+            create_confirmation_keyboard()
+        )
+
+        # Apaga a mensagem "caçando".
+        try:
+
+            await processing_message.delete()
+
+        except Exception:
+
+            pass
+
+        image_url = product.get(
+            "image_url"
+        )
+
+        # ----------------------------------------------------
+        # COM IMAGEM
+        # ----------------------------------------------------
+
+        if image_url:
+
+            try:
+
+                await update.message.reply_photo(
+                    photo=image_url,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+
+                return
+
+            except Exception as image_error:
+
+                logger.warning(
+                    "Não foi possível enviar a imagem: %s",
+                    image_error
+                )
+
+        # ----------------------------------------------------
+        # SEM IMAGEM
+        # ----------------------------------------------------
 
         await update.message.reply_text(
-            "❌ Não consegui processar esse produto.\n\n"
-            "Tente novamente."
+            caption,
+            parse_mode="HTML",
+            reply_markup=keyboard
         )
+
+    except ShopeeAPIError as error:
+
+        logger.exception(
+            "Erro da API Shopee."
+        )
+
+        try:
+
+            await processing_message.edit_text(
+                "❌ <b>Erro na API da Shopee.</b>\n\n"
+                f"<code>{safe_html(error)}</code>",
+                parse_mode="HTML"
+            )
+
+        except Exception:
+
+            await update.message.reply_text(
+                "❌ Ocorreu um erro ao consultar "
+                "a API da Shopee."
+            )
+
+    except Exception as error:
+
+        logger.exception(
+            "Erro processando produto."
+        )
+
+        try:
+
+            await processing_message.edit_text(
+                "❌ <b>Não consegui processar o produto.</b>\n\n"
+                "Verifique o link e tente novamente.",
+                parse_mode="HTML"
+            )
+
+        except Exception:
+
+            await update.message.reply_text(
+                "❌ Não consegui processar o produto."
+            )
 
 
 # ============================================================
@@ -344,22 +711,36 @@ async def button_handler(
 
     query = update.callback_query
 
+    if not query:
+
+        return
+
+    # Verificação de segurança.
+    if not user_is_authorized(update):
+
+        await authorization_error(update)
+
+        return
+
     await query.answer()
 
-    product = context.user_data.get("pending_product")
+    product = context.user_data.get(
+        "pending_product"
+    )
 
     if not product:
 
         await query.edit_message_text(
-            "⚠️ Esse anúncio expirou.\n\n"
-            "Envie o link novamente."
+            "⚠️ <b>Essa publicação expirou.</b>\n\n"
+            "Envie o link novamente.",
+            parse_mode="HTML"
         )
 
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # CANCELAR
-    # --------------------------------------------------------
+    # ========================================================
 
     if query.data == "cancel":
 
@@ -369,34 +750,80 @@ async def button_handler(
         )
 
         await query.edit_message_text(
-            "❌ Publicação cancelada."
+            "❌ <b>Publicação cancelada.</b>\n\n"
+            "🦊 A Raposa guardou esse achado.",
+            parse_mode="HTML"
         )
 
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # PUBLICAR
-    # --------------------------------------------------------
+    # ========================================================
 
     if query.data == "publish":
 
         try:
 
-            caption = create_caption(product)
-
-            keyboard = create_buy_button(
-                product["url"]
+            caption = create_caption(
+                product
             )
 
-            if product.get("image_url"):
+            affiliate_link = (
+                product.get("affiliate_link")
+                or product.get("url")
+                or product.get("original_url")
+            )
 
-                await context.bot.send_photo(
-                    chat_id=CHANNEL_ID,
-                    photo=product["image_url"],
-                    caption=caption,
-                    parse_mode="HTML",
-                    reply_markup=keyboard
+            if not affiliate_link:
+
+                raise Exception(
+                    "Produto não possui link de compra."
                 )
+
+            keyboard = create_buy_keyboard(
+                affiliate_link
+            )
+
+            image_url = product.get(
+                "image_url"
+            )
+
+            # ------------------------------------------------
+            # PUBLICAR COM IMAGEM
+            # ------------------------------------------------
+
+            if image_url:
+
+                try:
+
+                    await context.bot.send_photo(
+                        chat_id=CHANNEL_ID,
+                        photo=image_url,
+                        caption=caption,
+                        parse_mode="HTML",
+                        reply_markup=keyboard
+                    )
+
+                except Exception as image_error:
+
+                    logger.warning(
+                        "Falha ao publicar imagem: %s",
+                        image_error
+                    )
+
+                    # Se a imagem falhar,
+                    # publica somente o texto.
+                    await context.bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text=caption,
+                        parse_mode="HTML",
+                        reply_markup=keyboard
+                    )
+
+            # ------------------------------------------------
+            # PUBLICAR SOMENTE TEXTO
+            # ------------------------------------------------
 
             else:
 
@@ -407,49 +834,115 @@ async def button_handler(
                     reply_markup=keyboard
                 )
 
-            save_product(product)
+            # Salva depois de publicar.
+            save_product(
+                product
+            )
 
+            # Limpa a oferta temporária.
             context.user_data.pop(
                 "pending_product",
                 None
             )
 
-            await query.edit_message_text(
-                "✅ <b>Publicado com sucesso!</b>\n\n"
-                "🦊 A Raposa Caçadora encontrou mais um achadinho.",
-                parse_mode="HTML"
+            # Atualiza a mensagem de confirmação.
+            try:
+
+                await query.edit_message_text(
+                    "✅ <b>PUBLICADO COM SUCESSO!</b>\n\n"
+                    "🦊 A Raposa Caçadora encontrou "
+                    "mais um achadinho.\n\n"
+                    "📢 O produto já foi enviado "
+                    "para o canal.",
+                    parse_mode="HTML"
+                )
+
+            except Exception:
+
+                pass
+
+        except Exception as error:
+
+            logger.exception(
+                "Erro ao publicar no canal."
             )
 
-        except Exception as e:
-
-            logger.exception(e)
-
-            await query.edit_message_text(
-                "❌ Não consegui publicar no canal.\n\n"
-                "Verifique se o bot é administrador do canal "
-                "e se o CHANNEL_ID está correto."
+            error_text = safe_html(
+                str(error)
             )
+
+            try:
+
+                await query.edit_message_text(
+                    "❌ <b>Não consegui publicar.</b>\n\n"
+                    "Verifique se:\n\n"
+                    "• O bot é administrador do canal\n"
+                    "• O CHANNEL_ID está correto\n"
+                    "• O bot possui permissão para publicar\n\n"
+                    f"<code>{error_text}</code>",
+                    parse_mode="HTML"
+                )
+
+            except Exception:
+
+                pass
+
+
+# ============================================================
+# CANCELAR COMANDO
+# ============================================================
+
+async def cancel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not user_is_authorized(update):
+
+        await authorization_error(update)
+
+        return
+
+    context.user_data.pop(
+        "pending_product",
+        None
+    )
+
+    await update.message.reply_text(
+        "❌ Publicação cancelada."
+    )
 
 
 # ============================================================
 # ERROS
 # ============================================================
 
-async def error_handler(update, context):
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     logger.error(
-        "Erro no bot:",
+        "Erro não tratado:",
         exc_info=context.error
     )
 
 
 # ============================================================
-# MAIN
+# STARTUP
 # ============================================================
 
 def main():
 
+    logger.info(
+        "Inicializando banco de dados..."
+    )
+
     init_db()
+
+    logger.info(
+        "Iniciando Raposa Caçadora..."
+    )
 
     application = (
         Application.builder()
@@ -457,20 +950,46 @@ def main():
         .build()
     )
 
+    # --------------------------------------------------------
+    # COMANDOS
+    # --------------------------------------------------------
+
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     application.add_handler(
-        CommandHandler("help", help_command)
+        CommandHandler(
+            "help",
+            help_command
+        )
     )
+
+    application.add_handler(
+        CommandHandler(
+            "cancel",
+            cancel_command
+        )
+    )
+
+    # --------------------------------------------------------
+    # LINKS / TEXTOS
+    # --------------------------------------------------------
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT
+            & ~filters.COMMAND,
             receive_link
         )
     )
+
+    # --------------------------------------------------------
+    # BOTÕES
+    # --------------------------------------------------------
 
     application.add_handler(
         CallbackQueryHandler(
@@ -478,18 +997,29 @@ def main():
         )
     )
 
+    # --------------------------------------------------------
+    # ERROS
+    # --------------------------------------------------------
+
     application.add_error_handler(
         error_handler
     )
 
     logger.info(
-        "🦊 Raposa Caçadora iniciada!"
+        "🦊 Raposa Caçadora online!"
     )
 
+    # Polling é adequado para rodar como
+    # Background Worker no Render.
     application.run_polling(
         drop_pending_updates=True
     )
 
 
+# ============================================================
+# EXECUÇÃO
+# ============================================================
+
 if __name__ == "__main__":
+
     main()
