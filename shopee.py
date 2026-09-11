@@ -3,6 +3,7 @@ import json
 import time
 import hashlib
 import requests
+import re
 
 
 # ============================================================
@@ -18,7 +19,7 @@ SHOPEE_API_URL = (
 
 
 # ============================================================
-# ERRO PERSONALIZADO
+# ERRO
 # ============================================================
 
 class ShopeeAPIError(Exception):
@@ -33,12 +34,12 @@ def validate_config():
 
     if not SHOPEE_APP_ID:
         raise ShopeeAPIError(
-            "SHOPEE_APP_ID não configurado no Render."
+            "SHOPEE_APP_ID não configurado."
         )
 
     if not SHOPEE_SECRET:
         raise ShopeeAPIError(
-            "SHOPEE_SECRET não configurado no Render."
+            "SHOPEE_SECRET não configurado."
         )
 
 
@@ -46,7 +47,10 @@ def validate_config():
 # ASSINATURA
 # ============================================================
 
-def generate_signature(payload, timestamp):
+def generate_signature(
+    payload,
+    timestamp
+):
 
     raw = (
         str(SHOPEE_APP_ID)
@@ -61,10 +65,13 @@ def generate_signature(payload, timestamp):
 
 
 # ============================================================
-# GRAPHQL
+# REQUEST GRAPHQL
 # ============================================================
 
-def graphql_request(query, variables=None):
+def graphql_request(
+    query,
+    variables=None
+):
 
     validate_config()
 
@@ -88,15 +95,13 @@ def graphql_request(query, variables=None):
         timestamp
     )
 
-    authorization = (
-        f"SHA256 "
-        f"Credential={SHOPEE_APP_ID},"
-        f"Timestamp={timestamp},"
-        f"Signature={signature}"
-    )
-
     headers = {
-        "Authorization": authorization,
+        "Authorization": (
+            f"SHA256 "
+            f"Credential={SHOPEE_APP_ID},"
+            f"Timestamp={timestamp},"
+            f"Signature={signature}"
+        ),
         "Content-Type": "application/json",
     }
 
@@ -112,14 +117,13 @@ def graphql_request(query, variables=None):
     except requests.RequestException as error:
 
         raise ShopeeAPIError(
-            f"Erro de conexão com a Shopee: {error}"
+            f"Erro de conexão: {error}"
         )
 
     if response.status_code != 200:
 
         raise ShopeeAPIError(
-            f"Shopee retornou HTTP "
-            f"{response.status_code}: "
+            f"HTTP {response.status_code}: "
             f"{response.text[:500]}"
         )
 
@@ -130,7 +134,7 @@ def graphql_request(query, variables=None):
     except ValueError:
 
         raise ShopeeAPIError(
-            "A Shopee retornou uma resposta inválida."
+            "A Shopee retornou JSON inválido."
         )
 
     if result.get("errors"):
@@ -143,142 +147,115 @@ def graphql_request(query, variables=None):
             )
         )
 
-    return result.get("data", {})
-
-
-# ============================================================
-# GERAR LINK DE AFILIADO
-# ============================================================
-
-def generate_affiliate_link(original_url):
-
-    """
-    Gera um link curto/rastreável de afiliado.
-
-    OBS:
-    O formato exato da mutation deve ser confirmado
-    no Explorer da conta da Shopee caso a API da sua
-    conta utilize uma versão diferente.
-    """
-
-    mutation = """
-    mutation GenerateShortLink(
-        $originUrl: String!
-    ) {
-        generateShortLink(
-            input: {
-                originUrl: $originUrl
-            }
-        ) {
-            shortLink
-        }
-    }
-    """
-
-    variables = {
-        "originUrl": original_url
-    }
-
-    data = graphql_request(
-        mutation,
-        variables
+    return result.get(
+        "data",
+        {}
     )
 
-    result = data.get(
-        "generateShortLink"
-    )
-
-    if not result:
-
-        raise ShopeeAPIError(
-            "A API não retornou o link de afiliado."
-        )
-
-    short_link = result.get(
-        "shortLink"
-    )
-
-    if not short_link:
-
-        raise ShopeeAPIError(
-            "A Shopee não retornou shortLink."
-        )
-
-    return short_link
-
 
 # ============================================================
-# CONSULTAR PRODUTO
+# PRODUCT OFFER V2
 # ============================================================
 
-def get_product_offer(
-    product_url=None,
-    item_id=None
+def product_offer_v2(
+    page=1,
+    limit=20,
+    keyword=None
 ):
 
     """
-    Consulta ofertas de produtos.
+    Consulta ofertas da Shopee.
 
-    IMPORTANTE:
-
-    A estrutura GraphQL disponível para a sua conta pode
-    variar. Por isso, se a Shopee retornar erro de campo,
-    usamos o Explorer oficial para ajustar a query.
+    A query utiliza os campos que você mostrou
+    no retorno real da sua API.
     """
 
     query = """
-    query ProductOffer(
-        $itemId: Int
+    query ProductOfferV2(
+        $page: Int
+        $limit: Int
+        $keyword: String
     ) {
         productOfferV2(
-            itemId: $itemId
+            page: $page
+            limit: $limit
+            keyword: $keyword
         ) {
             nodes {
-                itemId
                 productName
-                productLink
-                offerLink
-                imageUrl
-                priceMin
-                priceMax
+                itemId
                 commissionRate
                 commission
+                price
+                sales
+                imageUrl
+                shopName
+                productLink
+                offerLink
+                periodStartTime
+                periodEndTime
+                priceMin
+                priceMax
+                productCatIds
+                ratingStar
+                priceDiscountRate
+                shopId
+                shopType
+                sellerCommissionRate
+                shopeeCommissionRate
+            }
+
+            pageInfo {
+                page
+                limit
+                hasNextPage
+                scrollId
             }
         }
     }
     """
 
     variables = {
-        "itemId": item_id
+        "page": page,
+        "limit": limit,
     }
 
-    data = graphql_request(
+    if keyword:
+
+        variables["keyword"] = keyword
+
+    return graphql_request(
         query,
         variables
     )
 
-    result = data.get(
-        "productOfferV2"
-    )
 
-    if not result:
+# ============================================================
+# FORMATAR PREÇO
+# ============================================================
 
-        raise ShopeeAPIError(
-            "A API não retornou productOfferV2."
+def format_price(value):
+
+    if value is None:
+        return ""
+
+    try:
+
+        number = float(value)
+
+        return (
+            f"R$ {number:,.2f}"
+            .replace(",", "X")
+            .replace(".", ",")
+            .replace("X", ".")
         )
 
-    nodes = result.get(
-        "nodes",
-        []
-    )
+    except (
+        ValueError,
+        TypeError
+    ):
 
-    if not nodes:
-
-        raise ShopeeAPIError(
-            "Nenhum produto encontrado."
-        )
-
-    return nodes
+        return str(value)
 
 
 # ============================================================
@@ -288,22 +265,21 @@ def get_product_offer(
 def extract_item_id(url):
 
     """
-    Tenta encontrar o item_id em URLs da Shopee.
+    Extrai o itemId de URLs normais da Shopee.
 
-    Exemplos possíveis:
+    Exemplo:
 
-    /product/123456/789012345
-    /123456/789012345
+    https://shopee.com.br/product/1573388099/52514564881
+
+    retorna:
+
+    52514564881
     """
-
-    import re
 
     patterns = [
 
-        # /product/shopid/itemid
         r"/product/\d+/(\d+)",
 
-        # /shopid/itemid
         r"/\d+/(\d+)",
 
     ]
@@ -325,28 +301,70 @@ def extract_item_id(url):
 
 
 # ============================================================
+# PROCURAR PRODUTO NA LISTA
+# ============================================================
+
+def find_product_in_results(
+    products,
+    original_url
+):
+
+    original_item_id = extract_item_id(
+        original_url
+    )
+
+    # --------------------------------------------------------
+    # PRIMEIRA TENTATIVA:
+    # procurar pelo itemId
+    # --------------------------------------------------------
+
+    if original_item_id:
+
+        for product in products:
+
+            if int(
+                product.get("itemId", 0)
+            ) == original_item_id:
+
+                return product
+
+    # --------------------------------------------------------
+    # SEGUNDA TENTATIVA:
+    # procurar pelo offerLink
+    # --------------------------------------------------------
+
+    original_url_clean = (
+        original_url.rstrip("/")
+    )
+
+    for product in products:
+
+        offer_link = (
+            product.get("offerLink")
+            or ""
+        )
+
+        if (
+            offer_link.rstrip("/")
+            == original_url_clean
+        ):
+
+            return product
+
+    return None
+
+
+# ============================================================
 # TRANSFORMAR PRODUTO
 # ============================================================
 
 def normalize_product(
     product,
-    original_url,
-    affiliate_link
+    original_url
 ):
 
-    title = (
-        product.get("productName")
-        or "Produto Shopee"
-    )
-
-    image_url = (
-        product.get("imageUrl")
-    )
-
-    offer_link = (
-        product.get("offerLink")
-        or affiliate_link
-        or original_url
+    price = product.get(
+        "price"
     )
 
     price_min = product.get(
@@ -357,67 +375,152 @@ def normalize_product(
         "priceMax"
     )
 
-    # Se houver somente um preço.
-    if price_min is not None:
+    discount = product.get(
+        "priceDiscountRate"
+    )
 
-        price = price_min
+    # --------------------------------------------------------
+    # PREÇO
+    # --------------------------------------------------------
 
-    elif price_max is not None:
+    if price:
 
-        price = price_max
+        current_price = price
 
-    else:
+    elif price_min:
 
-        price = None
-
-    # Formatação simples.
-    if isinstance(price, (int, float)):
-
-        price_formatted = (
-            f"R$ {price:.2f}"
-            .replace(".", ",")
-        )
-
-    elif price is not None:
-
-        price_formatted = str(price)
+        current_price = price_min
 
     else:
 
-        price_formatted = ""
+        current_price = price_max
+
+    # --------------------------------------------------------
+    # PREÇO ANTERIOR
+    #
+    # A API fornece percentual de desconto.
+    # Podemos calcular uma aproximação.
+    # --------------------------------------------------------
+
+    old_price = None
+
+    if (
+        current_price
+        and discount
+        and float(discount) > 0
+    ):
+
+        try:
+
+            current = float(
+                current_price
+            )
+
+            discount_number = float(
+                discount
+            )
+
+            old = (
+                current
+                /
+                (1 - discount_number / 100)
+            )
+
+            old_price = old
+
+        except (
+            ValueError,
+            TypeError,
+            ZeroDivisionError
+        ):
+
+            old_price = None
+
+    # --------------------------------------------------------
+    # LINK
+    # --------------------------------------------------------
+
+    affiliate_link = (
+        product.get("offerLink")
+        or original_url
+    )
+
+    # --------------------------------------------------------
+    # RETORNO
+    # --------------------------------------------------------
 
     return {
 
-        "url": offer_link,
+        "url": affiliate_link,
 
         "original_url": original_url,
 
-        "affiliate_link": offer_link,
+        "affiliate_link": affiliate_link,
 
-        "title": title,
-
-        "price": price_formatted,
-
-        "old_price": "",
-
-        "image_url": image_url,
-
-        "commission_rate": product.get(
-            "commissionRate"
+        "title": (
+            product.get("productName")
+            or "Produto Shopee"
         ),
 
-        "commission": product.get(
-            "commission"
+        "price": format_price(
+            current_price
         ),
 
-        "item_id": product.get(
-            "itemId"
+        "old_price": (
+            format_price(old_price)
+            if old_price
+            else ""
+        ),
+
+        "image_url": (
+            product.get("imageUrl")
+        ),
+
+        "shop_name": (
+            product.get("shopName")
+            or ""
+        ),
+
+        "item_id": (
+            product.get("itemId")
+        ),
+
+        "discount": discount,
+
+        "commission_rate": (
+            product.get(
+                "commissionRate"
+            )
+        ),
+
+        "commission": (
+            product.get(
+                "commission"
+            )
+        ),
+
+        "sales": (
+            product.get(
+                "sales"
+            )
+        ),
+
+        "rating": (
+            product.get(
+                "ratingStar"
+            )
+        ),
+
+        "product_link": (
+            product.get(
+                "productLink"
+            )
         ),
     }
 
 
 # ============================================================
-# FUNÇÃO PRINCIPAL
+# FUNÇÃO PRINCIPAL USADA PELO BOT
 # ============================================================
 
 async def get_product_from_shopee(
@@ -425,63 +528,104 @@ async def get_product_from_shopee(
 ):
 
     """
-    Função usada pelo bot.py.
+    Recebe um link da Shopee.
 
-    Fluxo:
+    Retorna:
 
-    1. Recebe link.
-    2. Tenta descobrir item_id.
-    3. Consulta a API.
-    4. Gera link afiliado.
-    5. Retorna produto padronizado.
+    {
+        title,
+        price,
+        old_price,
+        image_url,
+        affiliate_link,
+        ...
+    }
     """
 
     # --------------------------------------------------------
-    # 1. ITEM ID
+    # ITEM ID
     # --------------------------------------------------------
 
     item_id = extract_item_id(
         url
     )
 
-    if not item_id:
+    # --------------------------------------------------------
+    # CASO O LINK JÁ SEJA UMA URL NORMAL
+    # --------------------------------------------------------
 
-        raise ShopeeAPIError(
-            "Não consegui identificar o ID do produto "
-            "nesse link da Shopee."
+    if item_id:
+
+        # Consulta produtos.
+        data = product_offer_v2(
+            page=1,
+            limit=20
         )
 
+        offer_data = data.get(
+            "productOfferV2",
+            {}
+        )
+
+        products = offer_data.get(
+            "nodes",
+            []
+        )
+
+        product = find_product_in_results(
+            products,
+            url
+        )
+
+        if product:
+
+            return normalize_product(
+                product,
+                url
+            )
+
     # --------------------------------------------------------
-    # 2. CONSULTAR API
+    # LINK CURTO
+    # --------------------------------------------------------
+    #
+    # Exemplo:
+    #
+    # https://s.shopee.com.br/AAH3wuxvT6
+    #
+    # Aqui não temos o itemId diretamente.
+    #
+    # Por isso precisamos consultar a API e
+    # localizar o produto pelo offerLink.
     # --------------------------------------------------------
 
-    products = get_product_offer(
-        product_url=url,
-        item_id=item_id
+    data = product_offer_v2(
+        page=1,
+        limit=20
     )
 
-    if not products:
+    offer_data = data.get(
+        "productOfferV2",
+        {}
+    )
 
-        raise ShopeeAPIError(
-            "Nenhum produto encontrado."
-        )
+    products = offer_data.get(
+        "nodes",
+        []
+    )
 
-    product = products[0]
-
-    # --------------------------------------------------------
-    # 3. LINK DE AFILIADO
-    # --------------------------------------------------------
-
-    affiliate_link = generate_affiliate_link(
+    product = find_product_in_results(
+        products,
         url
     )
 
-    # --------------------------------------------------------
-    # 4. NORMALIZAR
-    # --------------------------------------------------------
+    if not product:
+
+        raise ShopeeAPIError(
+            "Não encontrei esse produto no retorno "
+            "atual da productOfferV2."
+        )
 
     return normalize_product(
-        product=product,
-        original_url=url,
-        affiliate_link=affiliate_link
+        product,
+        url
     )
