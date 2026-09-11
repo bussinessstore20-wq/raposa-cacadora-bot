@@ -3,9 +3,16 @@ import json
 import time
 import hashlib
 import logging
-import requests
+from pathlib import Path
 
+import requests
 from telegram import Bot
+
+
+# ============================================================
+# RAPOSA CAÇADORA
+# Shopee Affiliate -> Telegram
+# ============================================================
 
 
 # ============================================================
@@ -18,34 +25,42 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SHOPEE_APP_ID = os.getenv("SHOPEE_APP_ID")
 SHOPEE_SECRET = os.getenv("SHOPEE_SECRET")
 
-
 SHOPEE_API_URL = (
     "https://open-api.affiliate.shopee.com.br/graphql"
 )
 
 
-# ============================================================
-# CONFIGURAÇÃO DOS FILTROS
-# ============================================================
+# Quantidade de produtos publicados por ciclo
+PRODUTOS_POR_CICLO = int(
+    os.getenv("PRODUTOS_POR_CICLO", "5")
+)
 
-# Só publica produtos com desconto igual ou maior que isso.
+# Intervalo entre ciclos
+INTERVALO_MINUTOS = int(
+    os.getenv("INTERVALO_MINUTOS", "30")
+)
+
+# Filtros
 DESCONTO_MINIMO = float(
     os.getenv("DESCONTO_MINIMO", "30")
 )
 
-# Só publica produtos com avaliação igual ou maior que isso.
 AVALIACAO_MINIMA = float(
     os.getenv("AVALIACAO_MINIMA", "4.5")
 )
 
-# Comissão mínima em reais.
 COMISSAO_MINIMA = float(
     os.getenv("COMISSAO_MINIMA", "3")
 )
 
-# Quantos produtos serão publicados por ciclo.
-PRODUTOS_POR_CICLO = int(
-    os.getenv("PRODUTOS_POR_CICLO", "3")
+VENDAS_MINIMAS = int(
+    os.getenv("VENDAS_MINIMAS", "0")
+)
+
+
+# Arquivo usado para evitar produtos repetidos
+ARQUIVO_ENVIADOS = Path(
+    "produtos_enviados.json"
 )
 
 
@@ -85,9 +100,43 @@ def validar_configuracao():
     if faltando:
 
         raise RuntimeError(
-            "Variáveis não configuradas: "
+            "Variáveis de ambiente faltando: "
             + ", ".join(faltando)
         )
+
+
+# ============================================================
+# CONVERSÃO NUMÉRICA
+# ============================================================
+
+def numero(valor):
+
+    try:
+        return float(valor)
+
+    except (TypeError, ValueError):
+
+        return 0.0
+
+
+# ============================================================
+# DINHEIRO
+# ============================================================
+
+def dinheiro(valor):
+
+    valor = numero(valor)
+
+    texto = f"{valor:,.2f}"
+
+    texto = (
+        texto
+        .replace(",", "X")
+        .replace(".", ",")
+        .replace("X", ".")
+    )
+
+    return f"R$ {texto}"
 
 
 # ============================================================
@@ -112,10 +161,10 @@ def gerar_assinatura(
 
 
 # ============================================================
-# GRAPHQL SHOPEE
+# REQUISIÇÃO GRAPHQL
 # ============================================================
 
-def shopee_request(
+def shopee_graphql(
     query
 ):
 
@@ -127,10 +176,13 @@ def shopee_request(
         "query": query
     }
 
+    # IMPORTANTE:
+    # A assinatura precisa usar exatamente
+    # o mesmo payload enviado no POST.
     payload = json.dumps(
         body,
-        separators=(",", ":"),
-        ensure_ascii=False
+        ensure_ascii=False,
+        separators=(",", ":")
     )
 
     assinatura = gerar_assinatura(
@@ -139,38 +191,54 @@ def shopee_request(
     )
 
     headers = {
+        "Content-Type": "application/json",
         "Authorization": (
-            f"SHA256 "
-            f"Credential={SHOPEE_APP_ID},"
-            f"Timestamp={timestamp},"
+            "SHA256 "
+            f"Credential={SHOPEE_APP_ID}, "
+            f"Timestamp={timestamp}, "
             f"Signature={assinatura}"
         ),
-        "Content-Type": "application/json",
     }
 
     response = requests.post(
         SHOPEE_API_URL,
         data=payload.encode("utf-8"),
         headers=headers,
-        timeout=30
+        timeout=40
+    )
+
+    logger.info(
+        "Shopee HTTP %s",
+        response.status_code
     )
 
     if response.status_code != 200:
 
         raise RuntimeError(
-            f"Erro Shopee HTTP "
-            f"{response.status_code}: "
-            f"{response.text[:500]}"
+            "Erro HTTP da Shopee: "
+            f"{response.status_code}\n"
+            f"{response.text[:1000]}"
         )
 
-    resultado = response.json()
+    try:
+
+        resultado = response.json()
+
+    except ValueError:
+
+        raise RuntimeError(
+            "A Shopee não retornou JSON:\n"
+            + response.text[:1000]
+        )
 
     if resultado.get("errors"):
 
         raise RuntimeError(
-            json.dumps(
+            "Erro da API Shopee:\n"
+            + json.dumps(
                 resultado["errors"],
-                ensure_ascii=False
+                ensure_ascii=False,
+                indent=2
             )
         )
 
@@ -185,38 +253,42 @@ def buscar_ofertas():
 
     query = """
     {
-        productOfferV2 {
-            nodes {
-                productName
-                itemId
-                commissionRate
-                commission
-                price
-                sales
-                imageUrl
-                shopName
-                productLink
-                offerLink
-                periodStartTime
-                periodEndTime
-                priceMin
-                priceMax
-                productCatIds
-                ratingStar
-                priceDiscountRate
-                shopId
-                shopType
-                sellerCommissionRate
-                shopeeCommissionRate
-            }
-
-            pageInfo {
-                page
-                limit
-                hasNextPage
-                scrollId
-            }
+      productOfferV2(
+        page: 1,
+        limit: 20,
+        sortType: 5
+      ) {
+        nodes {
+          productName
+          itemId
+          commissionRate
+          commission
+          price
+          sales
+          imageUrl
+          shopName
+          productLink
+          offerLink
+          periodStartTime
+          periodEndTime
+          priceMin
+          priceMax
+          productCatIds
+          ratingStar
+          priceDiscountRate
+          shopId
+          shopType
+          sellerCommissionRate
+          shopeeCommissionRate
         }
+
+        pageInfo {
+          page
+          limit
+          hasNextPage
+          scrollId
+        }
+      }
     }
     """
 
@@ -224,68 +296,95 @@ def buscar_ofertas():
         "Consultando ofertas da Shopee..."
     )
 
-    resultado = shopee_request(
+    resultado = shopee_graphql(
         query
     )
 
     try:
 
-        produtos = (
+        ofertas = (
             resultado
             ["data"]
             ["productOfferV2"]
             ["nodes"]
         )
 
-    except KeyError:
+    except (KeyError, TypeError):
 
         raise RuntimeError(
-            "Resposta da Shopee não possui "
-            "productOfferV2.nodes."
+            "Resposta inesperada da Shopee:\n"
+            + json.dumps(
+                resultado,
+                ensure_ascii=False,
+                indent=2
+            )
         )
 
     logger.info(
-        "%s produtos recebidos.",
-        len(produtos)
+        "%d ofertas recebidas.",
+        len(ofertas)
     )
 
-    return produtos
+    return ofertas
 
 
 # ============================================================
-# CONVERTER NÚMERO
+# PREÇO ORIGINAL ESTIMADO
 # ============================================================
 
-def numero(valor):
-
-    try:
-        return float(valor)
-
-    except (
-        ValueError,
-        TypeError
-    ):
-
-        return 0.0
-
-
-# ============================================================
-# FILTRAR PRODUTOS
-# ============================================================
-
-def filtrar_produtos(
-    produtos
+def calcular_preco_original(
+    preco,
+    desconto
 ):
 
-    aprovados = []
+    preco = numero(preco)
+    desconto = numero(desconto)
 
-    for produto in produtos:
+    if preco <= 0:
+        return None
+
+    if desconto <= 0:
+        return None
+
+    if desconto >= 100:
+        return None
+
+    return preco / (
+        1 - desconto / 100
+    )
+
+
+# ============================================================
+# FILTRAR OFERTAS
+# ============================================================
+
+def filtrar_ofertas(
+    ofertas
+):
+
+    aprovadas = []
+
+    for produto in ofertas:
 
         nome = produto.get(
             "productName"
         )
 
+        offer_link = produto.get(
+            "offerLink"
+        )
+
+        image_url = produto.get(
+            "imageUrl"
+        )
+
         if not nome:
+            continue
+
+        if not offer_link:
+            continue
+
+        if not image_url:
             continue
 
         preco = numero(
@@ -310,9 +409,18 @@ def filtrar_produtos(
             )
         )
 
+        vendas = int(
+            numero(
+                produto.get("sales")
+            )
+        )
+
         # ----------------------------------------------------
         # FILTROS
         # ----------------------------------------------------
+
+        if preco <= 0:
+            continue
 
         if desconto < DESCONTO_MINIMO:
             continue
@@ -323,262 +431,67 @@ def filtrar_produtos(
         if comissao < COMISSAO_MINIMA:
             continue
 
-        if preco <= 0:
+        if vendas < VENDAS_MINIMAS:
             continue
 
-        if not produto.get("imageUrl"):
-            continue
-
-        if not produto.get("offerLink"):
-            continue
-
-        aprovados.append(
+        aprovadas.append(
             produto
         )
 
     # --------------------------------------------------------
-    # MELHORES PRIMEIRO
+    # RANKING
     # --------------------------------------------------------
 
-    aprovados.sort(
-        key=lambda produto: (
-            numero(
-                produto.get(
-                    "commission"
-                )
-            ),
-            numero(
-                produto.get(
-                    "priceDiscountRate"
-                )
-            ),
-            numero(
-                produto.get(
-                    "ratingStar"
-                )
+    def pontuacao(produto):
+
+        desconto = numero(
+            produto.get(
+                "priceDiscountRate"
             )
-        ),
+        )
+
+        avaliacao = numero(
+            produto.get(
+                "ratingStar"
+            )
+        )
+
+        vendas = numero(
+            produto.get(
+                "sales"
+            )
+        )
+
+        comissao = numero(
+            produto.get(
+                "commission"
+            )
+        )
+
+        # Peso maior para desconto,
+        # avaliação e vendas.
+        return (
+            desconto * 3
+            + avaliacao * 10
+            + min(vendas, 10000) / 100
+            + comissao
+        )
+
+    aprovadas.sort(
+        key=pontuacao,
         reverse=True
     )
 
-    return aprovados
+    return aprovadas
 
 
 # ============================================================
-# FORMATAR DINHEIRO
+# ARQUIVO DE PRODUTOS ENVIADOS
 # ============================================================
-
-def dinheiro(valor):
-
-    valor = numero(valor)
-
-    texto = f"{valor:,.2f}"
-
-    texto = (
-        texto
-        .replace(",", "X")
-        .replace(".", ",")
-        .replace("X", ".")
-    )
-
-    return f"R$ {texto}"
-
-
-# ============================================================
-# CALCULAR PREÇO ANTIGO
-# ============================================================
-
-def calcular_preco_antigo(
-    preco,
-    desconto
-):
-
-    preco = numero(
-        preco
-    )
-
-    desconto = numero(
-        desconto
-    )
-
-    if (
-        preco <= 0
-        or desconto <= 0
-        or desconto >= 100
-    ):
-
-        return None
-
-    return (
-        preco
-        /
-        (1 - desconto / 100)
-    )
-
-
-# ============================================================
-# MONTAR PUBLICAÇÃO
-# ============================================================
-
-def montar_mensagem(
-    produto
-):
-
-    nome = produto.get(
-        "productName",
-        "Produto Shopee"
-    )
-
-    preco = numero(
-        produto.get("price")
-    )
-
-    desconto = numero(
-        produto.get(
-            "priceDiscountRate"
-        )
-    )
-
-    avaliacao = produto.get(
-        "ratingStar"
-    )
-
-    vendas = produto.get(
-        "sales"
-    )
-
-    loja = produto.get(
-        "shopName",
-        ""
-    )
-
-    comissao = numero(
-        produto.get(
-            "commission"
-        )
-    )
-
-    preco_antigo = (
-        calcular_preco_antigo(
-            preco,
-            desconto
-        )
-    )
-
-    # --------------------------------------------------------
-    # PREÇO ANTIGO
-    # --------------------------------------------------------
-
-    if preco_antigo:
-
-        linha_preco = (
-            f"❌ De: "
-            f"~{dinheiro(preco_antigo)}~\n"
-            f"✅ Por: "
-            f"*{dinheiro(preco)}*"
-        )
-
-    else:
-
-        linha_preco = (
-            f"✅ Por: "
-            f"*{dinheiro(preco)}*"
-        )
-
-    # --------------------------------------------------------
-    # MENSAGEM
-    # --------------------------------------------------------
-
-    mensagem = (
-        f"🦊 *RAPOSA CAÇADORA*\n\n"
-
-        f"🔥 *{nome}*\n\n"
-
-        f"{linha_preco}\n\n"
-
-        f"🏷️ *{desconto:.0f}% OFF*\n"
-        f"⭐ Avaliação: *{avaliacao}*\n"
-        f"🛍️ Loja: {loja}\n"
-        f"💰 Comissão: *{dinheiro(comissao)}*\n\n"
-
-        f"🛒 *COMPRE AQUI:*\n"
-        f"{produto.get('offerLink')}\n\n"
-
-        f"⚡ Aproveite enquanto estiver disponível!"
-    )
-
-    return mensagem
-
-
-# ============================================================
-# ENVIAR TELEGRAM
-# ============================================================
-
-def enviar_produto(
-    bot,
-    produto
-):
-
-    mensagem = montar_mensagem(
-        produto
-    )
-
-    imagem = produto.get(
-        "imageUrl"
-    )
-
-    logger.info(
-        "Publicando: %s",
-        produto.get("productName")
-    )
-
-    if imagem:
-
-        bot.send_photo(
-            chat_id=TELEGRAM_CHAT_ID,
-            photo=imagem,
-            caption=mensagem,
-            parse_mode="Markdown"
-        )
-
-    else:
-
-        bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=mensagem,
-            parse_mode="Markdown"
-        )
-
-
-# ============================================================
-# IDENTIFICADOR DO PRODUTO
-# ============================================================
-
-def id_produto(
-    produto
-):
-
-    return str(
-        produto.get(
-            "itemId"
-        )
-    )
-
-
-# ============================================================
-# CONTROLE DE DUPLICADOS
-# ============================================================
-
-ARQUIVO_ENVIADOS = (
-    "produtos_enviados.json"
-)
-
 
 def carregar_enviados():
 
-    if not os.path.exists(
-        ARQUIVO_ENVIADOS
-    ):
+    if not ARQUIVO_ENVIADOS.exists():
 
         return set()
 
@@ -599,7 +512,12 @@ def carregar_enviados():
             for item in dados
         )
 
-    except Exception:
+    except Exception as erro:
+
+        logger.warning(
+            "Não consegui ler produtos_enviados.json: %s",
+            erro
+        )
 
         return set()
 
@@ -623,83 +541,344 @@ def salvar_enviados(
 
 
 # ============================================================
-# EXECUTAR
+# TEXTO DA PUBLICAÇÃO
 # ============================================================
 
-def executar():
+def montar_mensagem(
+    produto
+):
+
+    nome = produto.get(
+        "productName",
+        "Produto"
+    )
+
+    preco = numero(
+        produto.get("price")
+    )
+
+    desconto = numero(
+        produto.get(
+            "priceDiscountRate"
+        )
+    )
+
+    avaliacao = numero(
+        produto.get(
+            "ratingStar"
+        )
+    )
+
+    vendas = int(
+        numero(
+            produto.get("sales")
+        )
+    )
+
+    loja = produto.get(
+        "shopName",
+        "Shopee"
+    )
+
+    comissao = numero(
+        produto.get(
+            "commission"
+        )
+    )
+
+    offer_link = produto.get(
+        "offerLink"
+    )
+
+    preco_original = (
+        calcular_preco_original(
+            preco,
+            desconto
+        )
+    )
+
+    if preco_original:
+
+        preco_linha = (
+            f"❌ De: ~{dinheiro(preco_original)}~\n"
+            f"✅ Por: *{dinheiro(preco)}*"
+        )
+
+    else:
+
+        preco_linha = (
+            f"✅ Por: *{dinheiro(preco)}*"
+        )
+
+    # Telegram MarkdownV2 é mais chato com
+    # caracteres especiais. Para evitar problemas,
+    # usamos HTML.
+    mensagem = (
+        "🦊 <b>RAPOSA CAÇADORA</b>\n\n"
+
+        f"🔥 <b>{nome}</b>\n\n"
+
+        f"{preco_linha}\n\n"
+
+        f"🏷️ <b>{desconto:.0f}% OFF</b>\n"
+        f"⭐ Avaliação: <b>{avaliacao:.1f}</b>\n"
+        f"🛍️ Loja: {loja}\n"
+        f"📦 Vendas: {vendas:,}\n"
+        f"💰 Comissão estimada: "
+        f"<b>{dinheiro(comissao)}</b>\n\n"
+
+        f"🛒 <b>COMPRE AQUI:</b>\n"
+        f"{offer_link}\n\n"
+
+        "⚡ <i>Aproveite enquanto estiver disponível!</i>"
+    )
+
+    return mensagem
+
+
+# ============================================================
+# ESCAPAR HTML
+# ============================================================
+
+def escapar_html(texto):
+
+    if texto is None:
+        return ""
+
+    return (
+        str(texto)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+# ============================================================
+# TEXTO SEGURO
+# ============================================================
+
+def montar_mensagem_segura(
+    produto
+):
+
+    nome = escapar_html(
+        produto.get(
+            "productName",
+            "Produto"
+        )
+    )
+
+    loja = escapar_html(
+        produto.get(
+            "shopName",
+            "Shopee"
+        )
+    )
+
+    preco = numero(
+        produto.get("price")
+    )
+
+    desconto = numero(
+        produto.get(
+            "priceDiscountRate"
+        )
+    )
+
+    avaliacao = numero(
+        produto.get(
+            "ratingStar"
+        )
+    )
+
+    vendas = int(
+        numero(
+            produto.get("sales")
+        )
+    )
+
+    comissao = numero(
+        produto.get(
+            "commission"
+        )
+    )
+
+    offer_link = produto.get(
+        "offerLink",
+        ""
+    )
+
+    preco_original = (
+        calcular_preco_original(
+            preco,
+            desconto
+        )
+    )
+
+    if preco_original:
+
+        preco_linha = (
+            f"❌ De: <s>{dinheiro(preco_original)}</s>\n"
+            f"✅ Por: <b>{dinheiro(preco)}</b>"
+        )
+
+    else:
+
+        preco_linha = (
+            f"✅ Por: <b>{dinheiro(preco)}</b>"
+        )
+
+    mensagem = (
+        "🦊 <b>RAPOSA CAÇADORA</b>\n\n"
+
+        f"🔥 <b>{nome}</b>\n\n"
+
+        f"{preco_linha}\n\n"
+
+        f"🏷️ <b>{desconto:.0f}% OFF</b>\n"
+        f"⭐ Avaliação: <b>{avaliacao:.1f}</b>\n"
+        f"🛍️ Loja: {loja}\n"
+        f"📦 Vendas: <b>{vendas:,}</b>\n"
+        f"💰 Comissão: <b>{dinheiro(comissao)}</b>\n\n"
+
+        "🛒 <b>COMPRE AQUI:</b>\n"
+        f"{offer_link}\n\n"
+
+        "⚡ <i>Aproveite enquanto estiver disponível!</i>"
+    )
+
+    return mensagem
+
+
+# ============================================================
+# PUBLICAR NO TELEGRAM
+# ============================================================
+
+def publicar_produto(
+    bot,
+    produto
+):
+
+    mensagem = montar_mensagem_segura(
+        produto
+    )
+
+    image_url = produto.get(
+        "imageUrl"
+    )
+
+    if image_url:
+
+        bot.send_photo(
+            chat_id=TELEGRAM_CHAT_ID,
+            photo=image_url,
+            caption=mensagem,
+            parse_mode="HTML"
+        )
+
+    else:
+
+        bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=mensagem,
+            parse_mode="HTML",
+            disable_web_page_preview=False
+        )
+
+
+# ============================================================
+# ID ÚNICO
+# ============================================================
+
+def obter_id_produto(
+    produto
+):
+
+    item_id = produto.get(
+        "itemId"
+    )
+
+    shop_id = produto.get(
+        "shopId"
+    )
+
+    if item_id:
+
+        return f"{shop_id}:{item_id}"
+
+    return produto.get(
+        "offerLink"
+    )
+
+
+# ============================================================
+# EXECUTAR UM CICLO
+# ============================================================
+
+def executar_ciclo(
+    bot
+):
 
     logger.info(
-        "🦊 Iniciando Raposa Caçadora..."
+        "======================================"
     )
 
-    validar_configuracao()
-
-    # --------------------------------------------------------
-    # TELEGRAM
-    # --------------------------------------------------------
-
-    bot = Bot(
-        token=TELEGRAM_TOKEN
+    logger.info(
+        "🦊 Iniciando novo ciclo..."
     )
-
-    # --------------------------------------------------------
-    # PRODUTOS JÁ ENVIADOS
-    # --------------------------------------------------------
 
     enviados = carregar_enviados()
 
-    # --------------------------------------------------------
-    # BUSCAR SHOPEE
-    # --------------------------------------------------------
+    ofertas = buscar_ofertas()
 
-    produtos = buscar_ofertas()
-
-    # --------------------------------------------------------
-    # FILTRAR
-    # --------------------------------------------------------
-
-    aprovados = filtrar_produtos(
-        produtos
+    aprovadas = filtrar_ofertas(
+        ofertas
     )
 
     logger.info(
-        "%s produtos aprovados.",
-        len(aprovados)
+        "%d ofertas aprovadas após filtros.",
+        len(aprovadas)
     )
 
     publicados = 0
 
-    # --------------------------------------------------------
-    # PUBLICAR
-    # --------------------------------------------------------
-
-    for produto in aprovados:
+    for produto in aprovadas:
 
         if publicados >= PRODUTOS_POR_CICLO:
             break
 
-        identificador = id_produto(
+        produto_id = obter_id_produto(
             produto
         )
 
-        if identificador in enviados:
+        if not produto_id:
+            continue
+
+        if str(produto_id) in enviados:
 
             logger.info(
-                "Produto já enviado: %s",
-                identificador
+                "Já enviado: %s",
+                produto_id
             )
 
             continue
 
         try:
 
-            enviar_produto(
+            logger.info(
+                "Publicando: %s",
+                produto.get(
+                    "productName"
+                )
+            )
+
+            publicar_produto(
                 bot,
                 produto
             )
 
             enviados.add(
-                identificador
+                str(produto_id)
             )
 
             salvar_enviados(
@@ -708,7 +887,9 @@ def executar():
 
             publicados += 1
 
-            time.sleep(2)
+            # Evita mandar várias mensagens
+            # praticamente ao mesmo tempo.
+            time.sleep(3)
 
         except Exception as erro:
 
@@ -718,16 +899,56 @@ def executar():
             )
 
     logger.info(
-        "Ciclo terminado. "
-        "%s produtos publicados.",
+        "Ciclo finalizado: %d publicados.",
         publicados
     )
 
 
 # ============================================================
-# MAIN
+# LOOP PRINCIPAL
+# ============================================================
+
+def main():
+
+    logger.info(
+        "🦊 RAPOSA CAÇADORA iniciando..."
+    )
+
+    validar_configuracao()
+
+    bot = Bot(
+        token=TELEGRAM_TOKEN
+    )
+
+    while True:
+
+        try:
+
+            executar_ciclo(
+                bot
+            )
+
+        except Exception as erro:
+
+            logger.exception(
+                "Erro no ciclo: %s",
+                erro
+            )
+
+        logger.info(
+            "Aguardando %d minutos...",
+            INTERVALO_MINUTOS
+        )
+
+        time.sleep(
+            INTERVALO_MINUTOS * 60
+        )
+
+
+# ============================================================
+# START
 # ============================================================
 
 if __name__ == "__main__":
 
-    executar()
+    main()
