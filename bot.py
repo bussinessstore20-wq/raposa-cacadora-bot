@@ -5,7 +5,11 @@ import os
 from pathlib import Path
 from typing import Any
 
-from telegram import Bot
+from telegram import (
+    Bot,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 
 from shopee import (
     buscar_ofertas,
@@ -497,7 +501,7 @@ def filtrar_ofertas(
 
 
 # ============================================================
-# MONTAGEM DA MENSAGEM
+# MONTAGEM DA MENSAGEM PREMIUM
 # ============================================================
 
 def montar_mensagem(
@@ -548,12 +552,16 @@ def montar_mensagem(
         or "Loja Shopee"
     )
 
-    # IMPORTANTE:
-    # Primeiro usamos offerLink.
+    # --------------------------------------------------------
+    # LINK DA OFERTA
+    # --------------------------------------------------------
+
+    # Primeiro tenta offerLink.
     #
-    # O productLink só é usado como
-    # último recurso caso offerLink
-    # não exista.
+    # Caso não exista, usa productLink.
+    #
+    # O link NÃO será exibido no texto.
+    # Ele será colocado no botão.
     offer_link = (
         produto.get(
             "offerLink"
@@ -604,39 +612,40 @@ def montar_mensagem(
         )
 
     # --------------------------------------------------------
-    # MENSAGEM
+    # MENSAGEM PREMIUM
     # --------------------------------------------------------
 
     mensagem = (
         "🦊 <b>RAPOSA CAÇADORA</b>\n"
         "\n"
-        f"🔥 <b>{nome}</b>\n"
+        "🔥 <b>OFERTA EM DESTAQUE</b>\n"
+        "\n"
+        f"✨ <b>{nome}</b>\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━\n"
         "\n"
         f"❌ De: <s>{moeda(preco_anterior)}</s>\n"
-        f"✅ <b>Por: {moeda(preco_atual)}</b>\n"
-        "\n"
+        f"💰 <b>Por apenas: {moeda(preco_atual)}</b>\n"
         f"🏷️ <b>{desconto:.0f}% OFF</b>\n"
-        f"⭐ Avaliação: {avaliacao:.1f}\n"
-        f"📦 Vendas: {formatar_vendas(vendas)}\n"
-        f"🏪 Loja: {loja}"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        f"⭐ <b>{avaliacao:.1f}</b>/5 de avaliação\n"
+        f"📦 <b>{formatar_vendas(vendas)}</b> vendas\n"
+        f"🏪 <b>{loja}</b>\n"
+        "\n"
+        "🚨 <b>Preço sujeito a alteração.</b>\n"
+        "⚡ Aproveite enquanto estiver disponível!"
     )
 
-    if offer_link:
-
-        mensagem += (
-            "\n\n"
-            "🛒 <b>COMPRE AQUI:</b>\n"
-            f"{offer_link}"
-        )
-
-    else:
+    if not offer_link:
 
         logger.warning(
             "Produto sem offerLink/productLink: %s",
             nome
         )
 
-    return mensagem
+    return mensagem, offer_link
 
 
 # ============================================================
@@ -648,7 +657,11 @@ async def publicar_produto(
     produto: dict[str, Any]
 ):
 
-    mensagem = montar_mensagem(
+    # --------------------------------------------------------
+    # MONTAR MENSAGEM
+    # --------------------------------------------------------
+
+    mensagem, offer_link = montar_mensagem(
         produto
     )
 
@@ -660,7 +673,37 @@ async def publicar_produto(
     )
 
     # --------------------------------------------------------
-    # TENTAR PUBLICAR IMAGEM + TEXTO
+    # CRIAR BOTÃO DE COMPRA
+    # --------------------------------------------------------
+
+    teclado = None
+
+    if offer_link:
+
+        botao_comprar = (
+            InlineKeyboardButton(
+                "🛒 COMPRAR AGORA",
+                url=offer_link
+            )
+        )
+
+        teclado = InlineKeyboardMarkup(
+            [
+                [
+                    botao_comprar
+                ]
+            ]
+        )
+
+    else:
+
+        logger.warning(
+            "Produto sem link. "
+            "Será publicado sem botão."
+        )
+
+    # --------------------------------------------------------
+    # PUBLICAR IMAGEM + TEXTO + BOTÃO
     # --------------------------------------------------------
 
     if image_url:
@@ -671,12 +714,13 @@ async def publicar_produto(
                 chat_id=TELEGRAM_CHAT_ID,
                 photo=image_url,
                 caption=mensagem,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=teclado
             )
 
             logger.info(
                 "Produto publicado com "
-                "imagem com sucesso."
+                "imagem e botão com sucesso."
             )
 
             return True
@@ -691,7 +735,7 @@ async def publicar_produto(
             )
 
     # --------------------------------------------------------
-    # FALLBACK: SOMENTE TEXTO
+    # FALLBACK: SOMENTE TEXTO + BOTÃO
     # --------------------------------------------------------
 
     try:
@@ -700,7 +744,8 @@ async def publicar_produto(
             chat_id=TELEGRAM_CHAT_ID,
             text=mensagem,
             parse_mode="HTML",
-            disable_web_page_preview=False
+            reply_markup=teclado,
+            disable_web_page_preview=True
         )
 
         logger.info(
