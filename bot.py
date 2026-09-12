@@ -17,31 +17,62 @@ from shopee import (
 # CONFIGURAÇÃO
 # ============================================================
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_TOKEN = os.getenv(
+    "TELEGRAM_TOKEN",
+    ""
+).strip()
 
-INTERVALO_MINUTOS = int(
-    os.getenv("INTERVALO_MINUTOS", "2")
-)
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
+    ""
+).strip()
 
+
+# Quantos produtos publicar em cada ciclo
 PRODUTOS_POR_CICLO = int(
-    os.getenv("PRODUTOS_POR_CICLO", "1")
+    os.getenv(
+        "PRODUTOS_POR_CICLO",
+        "1"
+    )
 )
 
+
+# Tempo entre os ciclos
+INTERVALO_MINUTOS = int(
+    os.getenv(
+        "INTERVALO_MINUTOS",
+        "2"
+    )
+)
+
+
+# Filtros
 DESCONTO_MINIMO = float(
-    os.getenv("DESCONTO_MINIMO", "30")
+    os.getenv(
+        "DESCONTO_MINIMO",
+        "30"
+    )
 )
 
 AVALIACAO_MINIMA = float(
-    os.getenv("AVALIACAO_MINIMA", "4.5")
+    os.getenv(
+        "AVALIACAO_MINIMA",
+        "4.5"
+    )
 )
 
 VENDAS_MINIMAS = int(
-    os.getenv("VENDAS_MINIMAS", "0")
+    os.getenv(
+        "VENDAS_MINIMAS",
+        "0"
+    )
 )
 
 COMISSAO_MINIMA = float(
-    os.getenv("COMISSAO_MINIMA", "0")
+    os.getenv(
+        "COMISSAO_MINIMA",
+        "0"
+    )
 )
 
 
@@ -74,7 +105,7 @@ logger = logging.getLogger(
 
 
 # ============================================================
-# CONFIGURAÇÃO
+# VALIDAÇÃO DA CONFIGURAÇÃO
 # ============================================================
 
 def validar_configuracao():
@@ -91,10 +122,42 @@ def validar_configuracao():
             "TELEGRAM_CHAT_ID não configurado"
         )
 
+    if PRODUTOS_POR_CICLO < 1:
+        erros.append(
+            "PRODUTOS_POR_CICLO deve ser maior que 0"
+        )
+
+    if INTERVALO_MINUTOS < 1:
+        erros.append(
+            "INTERVALO_MINUTOS deve ser maior que 0"
+        )
+
+    if DESCONTO_MINIMO < 0:
+        erros.append(
+            "DESCONTO_MINIMO não pode ser negativo"
+        )
+
+    if AVALIACAO_MINIMA < 0:
+        erros.append(
+            "AVALIACAO_MINIMA não pode ser negativa"
+        )
+
+    if VENDAS_MINIMAS < 0:
+        erros.append(
+            "VENDAS_MINIMAS não pode ser negativa"
+        )
+
+    if COMISSAO_MINIMA < 0:
+        erros.append(
+            "COMISSAO_MINIMA não pode ser negativa"
+        )
+
     if erros:
 
         for erro in erros:
-            logger.error(erro)
+            logger.error(
+                erro
+            )
 
         raise RuntimeError(
             "Configuração inválida."
@@ -102,6 +165,36 @@ def validar_configuracao():
 
     logger.info(
         "Configuração validada."
+    )
+
+    logger.info(
+        "Produtos por ciclo: %d",
+        PRODUTOS_POR_CICLO
+    )
+
+    logger.info(
+        "Intervalo: %d minutos",
+        INTERVALO_MINUTOS
+    )
+
+    logger.info(
+        "Desconto mínimo: %.0f%%",
+        DESCONTO_MINIMO
+    )
+
+    logger.info(
+        "Avaliação mínima: %.1f",
+        AVALIACAO_MINIMA
+    )
+
+    logger.info(
+        "Vendas mínimas: %d",
+        VENDAS_MINIMAS
+    )
+
+    logger.info(
+        "Comissão mínima: %.1f%%",
+        COMISSAO_MINIMA
     )
 
 
@@ -112,6 +205,11 @@ def validar_configuracao():
 def carregar_enviados():
 
     if not ARQUIVO_ENVIADOS.exists():
+
+        logger.info(
+            "Arquivo de produtos enviados "
+            "ainda não existe."
+        )
 
         return set()
 
@@ -132,12 +230,25 @@ def carregar_enviados():
             list
         ):
 
+            logger.warning(
+                "produtos_enviados.json "
+                "não contém uma lista."
+            )
+
             return set()
 
-        return {
+        enviados = {
             str(item)
             for item in dados
         }
+
+        logger.info(
+            "%d produtos já registrados "
+            "como enviados.",
+            len(enviados)
+        )
+
+        return enviados
 
     except Exception as erro:
 
@@ -150,7 +261,9 @@ def carregar_enviados():
         return set()
 
 
-def salvar_enviados(enviados):
+def salvar_enviados(
+    enviados
+):
 
     temporario = Path(
         "produtos_enviados.tmp"
@@ -165,9 +278,7 @@ def salvar_enviados(enviados):
         ) as arquivo:
 
             json.dump(
-                sorted(
-                    enviados
-                ),
+                sorted(enviados),
                 arquivo,
                 ensure_ascii=False,
                 indent=2
@@ -175,6 +286,12 @@ def salvar_enviados(enviados):
 
         temporario.replace(
             ARQUIVO_ENVIADOS
+        )
+
+        logger.info(
+            "Lista de produtos enviados "
+            "salva. Total: %d",
+            len(enviados)
         )
 
     except Exception as erro:
@@ -217,7 +334,7 @@ def obter_id_produto(
 
 
 # ============================================================
-# CONVERSÃO DE VALORES
+# CONVERSÃO DE NÚMEROS
 # ============================================================
 
 def numero(
@@ -230,8 +347,13 @@ def numero(
         if valor is None:
             return padrao
 
+        texto = str(valor).strip()
+
+        if not texto:
+            return padrao
+
         return float(
-            str(valor).replace(
+            texto.replace(
                 ",",
                 "."
             )
@@ -265,7 +387,9 @@ def inteiro(
 # MOEDA
 # ============================================================
 
-def moeda(valor):
+def moeda(
+    valor
+):
 
     valor = numero(
         valor
@@ -273,12 +397,39 @@ def moeda(valor):
 
     texto = (
         f"{valor:,.2f}"
-        .replace(",", "X")
-        .replace(".", ",")
-        .replace("X", ".")
+        .replace(
+            ",",
+            "X"
+        )
+        .replace(
+            ".",
+            ","
+        )
+        .replace(
+            "X",
+            "."
+        )
     )
 
     return f"R$ {texto}"
+
+
+# ============================================================
+# FORMATAÇÃO DE VENDAS
+# ============================================================
+
+def formatar_vendas(
+    vendas
+):
+
+    numero_vendas = inteiro(
+        vendas
+    )
+
+    return f"{numero_vendas:,}".replace(
+        ",",
+        "."
+    )
 
 
 # ============================================================
@@ -311,6 +462,12 @@ def filtrar_ofertas(
             )
         )
 
+        # A API retorna commissionRate
+        # como decimal.
+        #
+        # Exemplo:
+        # "0.46" = 46%
+        #
         comissao = (
             numero(
                 produto.get(
@@ -340,7 +497,7 @@ def filtrar_ofertas(
 
 
 # ============================================================
-# MENSAGEM
+# MONTAGEM DA MENSAGEM
 # ============================================================
 
 def montar_mensagem(
@@ -391,18 +548,30 @@ def montar_mensagem(
         or "Loja Shopee"
     )
 
+    # IMPORTANTE:
+    # Primeiro usamos offerLink.
+    #
+    # O productLink só é usado como
+    # último recurso caso offerLink
+    # não exista.
     offer_link = (
         produto.get(
             "offerLink"
         )
-        or produto.get(
-            "productLink"
-        )
         or ""
     )
 
+    if not offer_link:
+
+        offer_link = (
+            produto.get(
+                "productLink"
+            )
+            or ""
+        )
+
     # --------------------------------------------------------
-    # Preço anterior aproximado
+    # PREÇO ATUAL
     # --------------------------------------------------------
 
     preco_atual = preco
@@ -410,14 +579,22 @@ def montar_mensagem(
     if preco_min > 0:
         preco_atual = preco_min
 
+    # --------------------------------------------------------
+    # PREÇO ANTERIOR
+    # --------------------------------------------------------
+
     if (
         desconto > 0
+        and desconto < 100
         and preco_atual > 0
     ):
 
         preco_anterior = (
             preco_atual
-            / (1 - desconto / 100)
+            / (
+                1
+                - desconto / 100
+            )
         )
 
     else:
@@ -426,6 +603,10 @@ def montar_mensagem(
             preco_atual
         )
 
+    # --------------------------------------------------------
+    # MENSAGEM
+    # --------------------------------------------------------
+
     mensagem = (
         "🦊 <b>RAPOSA CAÇADORA</b>\n"
         "\n"
@@ -433,19 +614,11 @@ def montar_mensagem(
         "\n"
         f"❌ De: <s>{moeda(preco_anterior)}</s>\n"
         f"✅ <b>Por: {moeda(preco_atual)}</b>\n"
-    )
-
-    if desconto > 0:
-
-        mensagem += (
-            f"\n🏷️ <b>{desconto:.0f}% OFF</b>"
-        )
-
-    mensagem += (
-        f"\n⭐ Avaliação: {avaliacao:.1f}"
-        f"\n📦 Vendas: {vendas:,}"
-        f"\n🏪 Loja: {loja}"
-        .replace(",", ".")
+        "\n"
+        f"🏷️ <b>{desconto:.0f}% OFF</b>\n"
+        f"⭐ Avaliação: {avaliacao:.1f}\n"
+        f"📦 Vendas: {formatar_vendas(vendas)}\n"
+        f"🏪 Loja: {loja}"
     )
 
     if offer_link:
@@ -454,6 +627,13 @@ def montar_mensagem(
             "\n\n"
             "🛒 <b>COMPRE AQUI:</b>\n"
             f"{offer_link}"
+        )
+
+    else:
+
+        logger.warning(
+            "Produto sem offerLink/productLink: %s",
+            nome
         )
 
     return mensagem
@@ -479,6 +659,10 @@ async def publicar_produto(
         or ""
     )
 
+    # --------------------------------------------------------
+    # TENTAR PUBLICAR IMAGEM + TEXTO
+    # --------------------------------------------------------
+
     if image_url:
 
         try:
@@ -490,27 +674,55 @@ async def publicar_produto(
                 parse_mode="HTML"
             )
 
-            return
+            logger.info(
+                "Produto publicado com "
+                "imagem com sucesso."
+            )
+
+            return True
 
         except Exception as erro:
 
             logger.warning(
                 "Não foi possível enviar "
-                "a imagem. Enviando apenas texto. "
-                "Erro: %s",
+                "a imagem. Tentando enviar "
+                "apenas texto. Erro: %s",
                 erro
             )
 
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=mensagem,
-        parse_mode="HTML",
-        disable_web_page_preview=False
-    )
+    # --------------------------------------------------------
+    # FALLBACK: SOMENTE TEXTO
+    # --------------------------------------------------------
+
+    try:
+
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=mensagem,
+            parse_mode="HTML",
+            disable_web_page_preview=False
+        )
+
+        logger.info(
+            "Produto publicado somente "
+            "como texto."
+        )
+
+        return True
+
+    except Exception as erro:
+
+        logger.exception(
+            "Erro ao enviar mensagem "
+            "para o Telegram: %s",
+            erro
+        )
+
+        return False
 
 
 # ============================================================
-# CICLO
+# EXECUTAR CICLO
 # ============================================================
 
 async def executar_ciclo(
@@ -526,6 +738,10 @@ async def executar_ciclo(
     )
 
     enviados = carregar_enviados()
+
+    # --------------------------------------------------------
+    # CONSULTAR SHOPEE
+    # --------------------------------------------------------
 
     try:
 
@@ -553,6 +769,10 @@ async def executar_ciclo(
 
         return
 
+    # --------------------------------------------------------
+    # VERIFICAR RESULTADO
+    # --------------------------------------------------------
+
     if not ofertas:
 
         logger.warning(
@@ -566,6 +786,10 @@ async def executar_ciclo(
         len(ofertas)
     )
 
+    # --------------------------------------------------------
+    # APLICAR FILTROS
+    # --------------------------------------------------------
+
     ofertas_filtradas = filtrar_ofertas(
         ofertas
     )
@@ -575,12 +799,34 @@ async def executar_ciclo(
         len(ofertas_filtradas)
     )
 
+    if not ofertas_filtradas:
+
+        logger.info(
+            "Nenhum produto atende aos "
+            "filtros neste ciclo."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # PUBLICAR
+    # --------------------------------------------------------
+
     publicados = 0
 
     for produto in ofertas_filtradas:
 
+        # ----------------------------------------------------
+        # LIMITE DE PRODUTOS POR CICLO
+        # ----------------------------------------------------
+
         if publicados >= PRODUTOS_POR_CICLO:
+
             break
+
+        # ----------------------------------------------------
+        # IDENTIFICAR PRODUTO
+        # ----------------------------------------------------
 
         produto_id = obter_id_produto(
             produto
@@ -593,6 +839,10 @@ async def executar_ciclo(
             )
 
             continue
+
+        # ----------------------------------------------------
+        # VERIFICAR DUPLICIDADE
+        # ----------------------------------------------------
 
         if produto_id in enviados:
 
@@ -615,12 +865,26 @@ async def executar_ciclo(
             nome
         )
 
-        try:
+        logger.info(
+            "itemId: %s",
+            produto_id
+        )
 
-            await publicar_produto(
-                bot,
-                produto
-            )
+        # ----------------------------------------------------
+        # PUBLICAR NO TELEGRAM
+        # ----------------------------------------------------
+
+        sucesso = await publicar_produto(
+            bot,
+            produto
+        )
+
+        # ----------------------------------------------------
+        # SÓ MARCAR COMO ENVIADO
+        # SE O TELEGRAM CONFIRMAR SUCESSO
+        # ----------------------------------------------------
+
+        if sucesso:
 
             enviados.add(
                 produto_id
@@ -632,16 +896,26 @@ async def executar_ciclo(
 
             publicados += 1
 
-            await asyncio.sleep(
-                3
+            logger.info(
+                "Produto publicado com sucesso. "
+                "Total neste ciclo: %d/%d",
+                publicados,
+                PRODUTOS_POR_CICLO
             )
 
-        except Exception as erro:
+            # ------------------------------------------------
+            # PEQUENA PAUSA ENTRE PUBLICAÇÕES
+            # ------------------------------------------------
 
-            logger.exception(
-                "Erro ao publicar produto: %s",
-                erro
-            )
+            if publicados < PRODUTOS_POR_CICLO:
+
+                await asyncio.sleep(
+                    3
+                )
+
+    # --------------------------------------------------------
+    # FINAL DO CICLO
+    # --------------------------------------------------------
 
     logger.info(
         "Ciclo finalizado. "
@@ -660,7 +934,15 @@ async def main():
         "🦊 RAPOSA CAÇADORA iniciando..."
     )
 
+    # --------------------------------------------------------
+    # VALIDAR CONFIGURAÇÃO
+    # --------------------------------------------------------
+
     validar_configuracao()
+
+    # --------------------------------------------------------
+    # CONECTAR AO TELEGRAM
+    # --------------------------------------------------------
 
     async with Bot(
         token=TELEGRAM_TOKEN
@@ -685,6 +967,10 @@ async def main():
 
             raise
 
+        # ----------------------------------------------------
+        # LOOP PRINCIPAL
+        # ----------------------------------------------------
+
         while True:
 
             try:
@@ -696,9 +982,13 @@ async def main():
             except Exception as erro:
 
                 logger.exception(
-                    "Erro no ciclo: %s",
+                    "Erro inesperado no ciclo: %s",
                     erro
                 )
+
+            # ------------------------------------------------
+            # ESPERA ANTES DO PRÓXIMO CICLO
+            # ------------------------------------------------
 
             logger.info(
                 "Aguardando %d minutos...",
