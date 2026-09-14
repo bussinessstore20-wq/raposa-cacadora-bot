@@ -76,6 +76,12 @@ def resolver_link(
 
     link = link.strip()
 
+    if not link:
+
+        raise ShopeeAPIError(
+            "Link da Shopee está vazio."
+        )
+
     logger.info(
         "Resolvendo link da Shopee: %s",
         link
@@ -96,14 +102,25 @@ def resolver_link(
                     "Chrome/130.0.0.0 "
                     "Safari/537.36"
                 ),
-                "Accept-Language": "pt-BR,pt;q=0.9"
+                "Accept": (
+                    "text/html,"
+                    "application/xhtml+xml,"
+                    "application/xml;q=0.9,"
+                    "image/avif,"
+                    "image/webp,"
+                    "*/*;q=0.8"
+                ),
+                "Accept-Language": (
+                    "pt-BR,pt;q=0.9"
+                ),
             }
         )
 
     except requests.RequestException as erro:
 
         raise ShopeeAPIError(
-            f"Erro ao resolver link da Shopee: {erro}"
+            "Erro ao resolver link da Shopee: "
+            f"{erro}"
         ) from erro
 
     logger.info(
@@ -114,9 +131,9 @@ def resolver_link(
     if response.status_code >= 400:
 
         raise ShopeeAPIError(
-            f"Shopee retornou HTTP "
+            "Shopee retornou HTTP "
             f"{response.status_code} "
-            f"ao resolver o link."
+            "ao resolver o link."
         )
 
     url_final = response.url
@@ -125,6 +142,13 @@ def resolver_link(
         "URL final resolvida: %s",
         url_final
     )
+
+    if not url_final:
+
+        raise ShopeeAPIError(
+            "A Shopee não retornou uma "
+            "URL final."
+        )
 
     return url_final
 
@@ -141,11 +165,24 @@ def extrair_ids_da_url(
         "Extraindo IDs da URL..."
     )
 
+    if not url:
+
+        raise ShopeeAPIError(
+            "URL final vazia."
+        )
+
     parsed = urlparse(
         url
     )
 
-    caminho = parsed.path.strip("/")
+    caminho = parsed.path.strip(
+        "/"
+    )
+
+    logger.info(
+        "Caminho da URL: %s",
+        caminho
+    )
 
     # ========================================================
     # FORMATO:
@@ -155,7 +192,8 @@ def extrair_ids_da_url(
 
     match = re.search(
         r"-i\.(\d+)\.(\d+)",
-        caminho
+        caminho,
+        re.IGNORECASE
     )
 
     if match:
@@ -164,8 +202,8 @@ def extrair_ids_da_url(
         item_id = match.group(2)
 
         logger.info(
-            "IDs encontrados no formato -i: "
-            "shopId=%s | itemId=%s",
+            "IDs encontrados no formato "
+            "-i: shopId=%s | itemId=%s",
             shop_id,
             item_id
         )
@@ -182,8 +220,9 @@ def extrair_ids_da_url(
     # ========================================================
 
     match = re.search(
-        r"/product/(\d+)/(\d+)",
-        "/" + caminho
+        r"(?:^|/)product/(\d+)/(\d+)(?:/|$)",
+        caminho,
+        re.IGNORECASE
     )
 
     if match:
@@ -192,8 +231,8 @@ def extrair_ids_da_url(
         item_id = match.group(2)
 
         logger.info(
-            "IDs encontrados no formato product: "
-            "shopId=%s | itemId=%s",
+            "IDs encontrados no formato "
+            "product: shopId=%s | itemId=%s",
             shop_id,
             item_id
         )
@@ -204,11 +243,9 @@ def extrair_ids_da_url(
         )
 
     # ========================================================
-    # FORMATO DA SHOPEE OBSERVADO NO SEU LINK:
+    # FORMATO DA SHOPEE DO SEU LINK
     #
     # /opaanlp/1022739284/20299032787
-    #
-    # Aqui:
     #
     # shopId = 1022739284
     # itemId = 20299032787
@@ -220,31 +257,51 @@ def extrair_ids_da_url(
         if parte
     ]
 
-    numeros = [
-        parte
-        for parte in partes
-        if parte.isdigit()
-    ]
+    logger.info(
+        "Segmentos encontrados: %s",
+        partes
+    )
 
-    if len(numeros) >= 2:
+    # Procura dois números consecutivos.
+    #
+    # Exemplo:
+    #
+    # ['opaanlp', '1022739284', '20299032787']
+    #
+    # Resultado:
+    #
+    # shopId = 1022739284
+    # itemId = 20299032787
 
-        shop_id = numeros[-2]
-        item_id = numeros[-1]
+    for i in range(
+        len(partes) - 1
+    ):
 
-        logger.info(
-            "IDs encontrados por segmentos da URL: "
-            "shopId=%s | itemId=%s",
-            shop_id,
-            item_id
-        )
+        primeiro = partes[i]
+        segundo = partes[i + 1]
 
-        return (
-            shop_id,
-            item_id
-        )
+        if (
+            primeiro.isdigit()
+            and segundo.isdigit()
+        ):
+
+            shop_id = primeiro
+            item_id = segundo
+
+            logger.info(
+                "IDs encontrados no caminho: "
+                "shopId=%s | itemId=%s",
+                shop_id,
+                item_id
+            )
+
+            return (
+                shop_id,
+                item_id
+            )
 
     # ========================================================
-    # FORMATO POR QUERY STRING
+    # FORMATO COM QUERY STRING
     #
     # ?shopid=123456&itemid=789012
     # ========================================================
@@ -260,6 +317,9 @@ def extrair_ids_da_url(
         or parametros.get(
             "shopId"
         )
+        or parametros.get(
+            "shop_id"
+        )
     )
 
     item_values = (
@@ -269,9 +329,15 @@ def extrair_ids_da_url(
         or parametros.get(
             "itemId"
         )
+        or parametros.get(
+            "item_id"
+        )
     )
 
-    if shop_values and item_values:
+    if (
+        shop_values
+        and item_values
+    ):
 
         shop_id = shop_values[0]
         item_id = item_values[0]
@@ -288,14 +354,62 @@ def extrair_ids_da_url(
             item_id
         )
 
+    # ========================================================
+    # ÚLTIMA TENTATIVA
+    #
+    # Procura qualquer par de números no caminho.
+    # ========================================================
+
+    numeros = re.findall(
+        r"\d+",
+        caminho
+    )
+
+    if len(numeros) >= 2:
+
+        shop_id = numeros[-2]
+        item_id = numeros[-1]
+
+        logger.info(
+            "IDs encontrados por expressão "
+            "numérica: shopId=%s | itemId=%s",
+            shop_id,
+            item_id
+        )
+
+        return (
+            shop_id,
+            item_id
+        )
+
+    # ========================================================
+    # NÃO ENCONTROU
+    # ========================================================
+
+    logger.error(
+        "Não foi possível extrair "
+        "shopId/itemId."
+    )
+
+    logger.error(
+        "URL analisada: %s",
+        url
+    )
+
+    logger.error(
+        "Caminho analisado: %s",
+        caminho
+    )
+
     raise ShopeeAPIError(
         "Não foi possível encontrar "
-        "shopId/itemId na URL final da Shopee."
+        "shopId/itemId na URL final "
+        "da Shopee."
     )
 
 
 # ============================================================
-# ASSINATURA SHOPEE
+# ASSINATURA
 # ============================================================
 
 def _gerar_assinatura(
@@ -312,11 +426,13 @@ def _gerar_assinatura(
         f"{secret}"
     )
 
-    return hashlib.sha256(
+    assinatura = hashlib.sha256(
         texto_assinatura.encode(
             "utf-8"
         )
     ).hexdigest()
+
+    return assinatura
 
 
 # ============================================================
@@ -384,7 +500,7 @@ def _graphql(
     except requests.RequestException as erro:
 
         raise ShopeeAPIError(
-            f"Erro de conexão com a Shopee: "
+            "Erro de conexão com a Shopee: "
             f"{erro}"
         ) from erro
 
@@ -396,7 +512,7 @@ def _graphql(
     if response.status_code != 200:
 
         raise ShopeeAPIError(
-            f"Shopee respondeu HTTP "
+            "Shopee respondeu HTTP "
             f"{response.status_code}: "
             f"{response.text[:1000]}"
         )
@@ -412,14 +528,22 @@ def _graphql(
             "que não é JSON."
         ) from erro
 
+    # ========================================================
+    # ERROS GRAPHQL
+    # ========================================================
+
     if resultado.get(
         "errors"
     ):
 
+        erros = resultado.get(
+            "errors"
+        )
+
         logger.error(
-            "Erros GraphQL: %s",
+            "Erro GraphQL da Shopee: %s",
             json.dumps(
-                resultado["errors"],
+                erros,
                 ensure_ascii=False
             )
         )
@@ -428,7 +552,7 @@ def _graphql(
             "A API da Shopee retornou "
             "erros GraphQL: "
             + json.dumps(
-                resultado["errors"],
+                erros,
                 ensure_ascii=False
             )
         )
@@ -437,7 +561,7 @@ def _graphql(
 
 
 # ============================================================
-# QUERY
+# QUERY DO PRODUTO
 # ============================================================
 
 PRODUCT_QUERY = """
@@ -488,7 +612,7 @@ query ProductOffer(
 
 
 # ============================================================
-# BUSCAR PRODUTO POR IDs
+# BUSCAR PRODUTO POR ID
 # ============================================================
 
 def buscar_produto_por_ids(
@@ -513,10 +637,14 @@ def buscar_produto_por_ids(
             item_id
         )
 
-    except (TypeError, ValueError) as erro:
+    except (
+        TypeError,
+        ValueError
+    ) as erro:
 
         raise ShopeeAPIError(
-            "shopId/itemId inválidos."
+            "shopId/itemId inválidos: "
+            f"{shop_id}/{item_id}"
         ) from erro
 
     resultado = _graphql(
@@ -563,6 +691,26 @@ def buscar_produto_por_ids(
 
     produto = nodes[0]
 
+    # ========================================================
+    # GARANTIR OS IDs
+    # ========================================================
+
+    if not produto.get(
+        "shopId"
+    ):
+
+        produto[
+            "shopId"
+        ] = shop_id_int
+
+    if not produto.get(
+        "itemId"
+    ):
+
+        produto[
+            "itemId"
+        ] = item_id_int
+
     logger.info(
         "Produto encontrado: %s",
         produto.get(
@@ -590,15 +738,34 @@ def buscar_produto_por_link(
 
     link = link.strip()
 
+    # ========================================================
+    # RESOLVER LINK
+    # ========================================================
+
     url_final = resolver_link(
         link
     )
+
+    # ========================================================
+    # EXTRAIR IDs
+    # ========================================================
 
     shop_id, item_id = (
         extrair_ids_da_url(
             url_final
         )
     )
+
+    logger.info(
+        "IDs extraídos com sucesso: "
+        "shopId=%s | itemId=%s",
+        shop_id,
+        item_id
+    )
+
+    # ========================================================
+    # CONSULTAR API
+    # ========================================================
 
     produto = buscar_produto_por_ids(
         shop_id=shop_id,
@@ -609,14 +776,27 @@ def buscar_produto_por_link(
 
         raise ShopeeAPIError(
             "O produto não foi encontrado "
-            "na API de Afiliados."
+            "na API de Afiliados da Shopee."
         )
 
-    # IMPORTANTE:
-    # O botão do Telegram usará exatamente
-    # o link de afiliado que você colocou.
+    # ========================================================
+    # PRESERVAR O LINK DE AFILIADO
+    #
+    # O botão do Telegram usará o link
+    # original que você colocou no bot.
+    # ========================================================
+
     produto[
         "manualAffiliateLink"
     ] = link
+
+    produto[
+        "affiliateLink"
+    ] = link
+
+    logger.info(
+        "Link de afiliado original "
+        "preservado para o botão."
+    )
 
     return produto
