@@ -566,8 +566,8 @@ def _graphql(
 
 PRODUCT_QUERY = """
 query ProductOffer(
-    $shopId: Int,
-    $itemId: Int,
+    $shopId: Int64,
+    $itemId: Int64,
     $page: Int,
     $limit: Int
 ) {
