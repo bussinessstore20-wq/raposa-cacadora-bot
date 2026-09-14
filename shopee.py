@@ -2,7 +2,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
+from urllib.parse import urlparse, parse_qs
 
 import requests
 
@@ -18,74 +20,6 @@ SHOPEE_GRAPHQL_URL = os.getenv(
     "SHOPEE_GRAPHQL_URL",
     "https://open-api.affiliate.shopee.com.br/graphql",
 )
-
-
-# Quantidade de produtos por página
-SHOPEE_PAGE_LIMIT = int(
-    os.getenv(
-        "SHOPEE_PAGE_LIMIT",
-        "20"
-    )
-)
-
-
-# Quantidade máxima de páginas consultadas
-# em cada ciclo.
-#
-# 5 páginas x 20 produtos = até 100 produtos.
-MAX_PAGINAS = int(
-    os.getenv(
-        "MAX_PAGINAS",
-        "5"
-    )
-)
-
-
-# ============================================================
-# QUERY GRAPHQL
-# ============================================================
-
-PRODUCT_OFFER_QUERY = """
-query ProductOffers(
-    $page: Int,
-    $limit: Int
-) {
-    productOfferV2(
-        page: $page,
-        limit: $limit
-    ) {
-        nodes {
-            productName
-            itemId
-            commissionRate
-            commission
-            price
-            sales
-            imageUrl
-            shopName
-            productLink
-            offerLink
-            periodStartTime
-            periodEndTime
-            priceMin
-            priceMax
-            productCatIds
-            ratingStar
-            priceDiscountRate
-            shopId
-            shopType
-            sellerCommissionRate
-            shopeeCommissionRate
-        }
-
-        pageInfo {
-            page
-            limit
-            hasNextPage
-        }
-    }
-}
-"""
 
 
 # ============================================================
@@ -111,14 +45,12 @@ def _obter_credenciais():
     )
 
     if not app_id:
-
         raise ShopeeAPIError(
             "A variável SHOPEE_APP_ID "
             "não está configurada."
         )
 
     if not secret:
-
         raise ShopeeAPIError(
             "A variável SHOPEE_SECRET "
             "não está configurada."
@@ -131,29 +63,182 @@ def _obter_credenciais():
 
 
 # ============================================================
-# PAYLOAD
+# RESOLVER SHORT LINK
 # ============================================================
 
-def _criar_payload(
-    page: int,
-    limit: int
+def resolver_link(
+    link: str
 ):
 
-    payload = {
-        "query": PRODUCT_OFFER_QUERY,
-        "variables": {
-            "page": page,
-            "limit": limit
-        }
-    }
+    logger.info(
+        "Resolvendo link da Shopee: %s",
+        link
+    )
 
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(
-            ",",
-            ":"
+    try:
+
+        response = requests.get(
+            link,
+            allow_redirects=True,
+            timeout=30,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/130.0.0.0 "
+                    "Safari/537.36"
+                )
+            }
         )
+
+    except requests.RequestException as erro:
+
+        raise ShopeeAPIError(
+            f"Erro ao resolver link da Shopee: {erro}"
+        ) from erro
+
+    if response.status_code >= 400:
+
+        raise ShopeeAPIError(
+            f"Shopee retornou HTTP "
+            f"{response.status_code} "
+            f"ao resolver o link."
+        )
+
+    url_final = response.url
+
+    logger.info(
+        "URL final resolvida: %s",
+        url_final
+    )
+
+    return url_final
+
+
+# ============================================================
+# EXTRAIR SHOP ID / ITEM ID
+# ============================================================
+
+def extrair_ids_da_url(
+    url: str
+):
+
+    logger.info(
+        "Extraindo IDs da URL..."
+    )
+
+    parsed = urlparse(
+        url
+    )
+
+    caminho = parsed.path
+
+    # --------------------------------------------------------
+    # FORMATO:
+    #
+    # https://shopee.com.br/produto-i.123456.789012
+    # --------------------------------------------------------
+
+    match = re.search(
+        r"-i\.(\d+)\.(\d+)",
+        caminho
+    )
+
+    if match:
+
+        shop_id = match.group(1)
+        item_id = match.group(2)
+
+        logger.info(
+            "IDs encontrados: "
+            "shopId=%s | itemId=%s",
+            shop_id,
+            item_id
+        )
+
+        return (
+            shop_id,
+            item_id
+        )
+
+    # --------------------------------------------------------
+    # FORMATO:
+    #
+    # https://shopee.com.br/product/123456/789012
+    # --------------------------------------------------------
+
+    match = re.search(
+        r"/product/(\d+)/(\d+)",
+        caminho
+    )
+
+    if match:
+
+        shop_id = match.group(1)
+        item_id = match.group(2)
+
+        logger.info(
+            "IDs encontrados: "
+            "shopId=%s | itemId=%s",
+            shop_id,
+            item_id
+        )
+
+        return (
+            shop_id,
+            item_id
+        )
+
+    # --------------------------------------------------------
+    # FORMATO:
+    #
+    # ?shopid=123456&itemid=789012
+    # --------------------------------------------------------
+
+    parametros = parse_qs(
+        parsed.query
+    )
+
+    shop_values = (
+        parametros.get(
+            "shopid"
+        )
+        or parametros.get(
+            "shopId"
+        )
+    )
+
+    item_values = (
+        parametros.get(
+            "itemid"
+        )
+        or parametros.get(
+            "itemId"
+        )
+    )
+
+    if shop_values and item_values:
+
+        shop_id = shop_values[0]
+        item_id = item_values[0]
+
+        logger.info(
+            "IDs encontrados nos parâmetros: "
+            "shopId=%s | itemId=%s",
+            shop_id,
+            item_id
+        )
+
+        return (
+            shop_id,
+            item_id
+        )
+
+    raise ShopeeAPIError(
+        "Não foi possível encontrar "
+        "shopId/itemId na URL final da Shopee."
     )
 
 
@@ -175,31 +260,38 @@ def _gerar_assinatura(
         f"{secret}"
     )
 
-    assinatura = hashlib.sha256(
+    return hashlib.sha256(
         texto_assinatura.encode(
             "utf-8"
         )
     ).hexdigest()
 
-    return assinatura
-
 
 # ============================================================
-# CONSULTAR UMA PÁGINA
+# GRAPHQL
 # ============================================================
 
-def _consultar_pagina(
-    page: int,
-    limit: int
+def _graphql(
+    query: str,
+    variables: dict
 ):
 
     app_id, secret = (
         _obter_credenciais()
     )
 
-    payload = _criar_payload(
-        page=page,
-        limit=limit
+    payload_obj = {
+        "query": query,
+        "variables": variables
+    }
+
+    payload = json.dumps(
+        payload_obj,
+        ensure_ascii=False,
+        separators=(
+            ",",
+            ":"
+        )
     )
 
     timestamp = int(
@@ -245,8 +337,7 @@ def _consultar_pagina(
         ) from erro
 
     logger.info(
-        "Shopee página %d respondeu HTTP %d",
-        page,
+        "Shopee respondeu HTTP %d",
         response.status_code
     )
 
@@ -269,32 +360,116 @@ def _consultar_pagina(
             "que não é JSON."
         ) from erro
 
-    # --------------------------------------------------------
-    # ERROS GRAPHQL
-    # --------------------------------------------------------
-
     if resultado.get("errors"):
 
-        erros = resultado.get(
-            "errors"
-        )
-
         logger.error(
-            "Erro GraphQL da Shopee: %s",
+            "Erros GraphQL: %s",
             json.dumps(
-                erros,
+                resultado["errors"],
                 ensure_ascii=False
             )
         )
 
         raise ShopeeAPIError(
             "A API da Shopee retornou "
-            "erros GraphQL: "
-            + json.dumps(
-                erros,
-                ensure_ascii=False
-            )
+            "erros GraphQL."
         )
+
+    return resultado
+
+
+# ============================================================
+# QUERY DE PRODUTO
+# ============================================================
+
+PRODUCT_QUERY = """
+query ProductOffer(
+    $shopId: Int,
+    $itemId: Int,
+    $page: Int,
+    $limit: Int
+) {
+    productOfferV2(
+        shopId: $shopId,
+        itemId: $itemId,
+        page: $page,
+        limit: $limit
+    ) {
+        nodes {
+            productName
+            itemId
+            commissionRate
+            commission
+            price
+            sales
+            imageUrl
+            shopName
+            productLink
+            offerLink
+            periodStartTime
+            periodEndTime
+            priceMin
+            priceMax
+            productCatIds
+            ratingStar
+            priceDiscountRate
+            shopId
+            shopType
+            sellerCommissionRate
+            shopeeCommissionRate
+        }
+
+        pageInfo {
+            page
+            limit
+            hasNextPage
+        }
+    }
+}
+"""
+
+
+# ============================================================
+# BUSCAR PRODUTO POR SHOP ID + ITEM ID
+# ============================================================
+
+def buscar_produto_por_ids(
+    shop_id,
+    item_id
+):
+
+    logger.info(
+        "Consultando produto: "
+        "shopId=%s | itemId=%s",
+        shop_id,
+        item_id
+    )
+
+    try:
+
+        shop_id_int = int(
+            shop_id
+        )
+
+        item_id_int = int(
+            item_id
+        )
+
+    except ValueError as erro:
+
+        raise ShopeeAPIError(
+            "shopId/itemId inválidos."
+        ) from erro
+
+    resultado = _graphql(
+        query=PRODUCT_QUERY,
+        variables={
+            "shopId": shop_id_int,
+            "itemId": item_id_int,
+            "page": 1,
+            "limit": 1
+        }
+    )
 
     data = (
         resultado.get(
@@ -317,177 +492,85 @@ def _consultar_pagina(
         or []
     )
 
-    page_info = (
-        product_offer.get(
-            "pageInfo"
-        )
-        or {}
-    )
+    if not nodes:
 
-    return (
-        nodes,
-        page_info
-    )
-
-
-# ============================================================
-# BUSCAR OFERTAS COM PAGINAÇÃO
-# ============================================================
-
-def buscar_ofertas():
-
-    logger.info(
-        "Iniciando busca paginada "
-        "de ofertas da Shopee..."
-    )
-
-    todas_ofertas = []
-
-    pagina = 1
-
-    while pagina <= MAX_PAGINAS:
-
-        logger.info(
-            "Consultando página %d/%d "
-            "(limite: %d produtos)...",
-            pagina,
-            MAX_PAGINAS,
-            SHOPEE_PAGE_LIMIT
-        )
-
-        try:
-
-            ofertas, page_info = (
-                _consultar_pagina(
-                    page=pagina,
-                    limit=SHOPEE_PAGE_LIMIT
-                )
-            )
-
-        except ShopeeAPIError:
-
-            # Se a primeira página falhar,
-            # não temos ofertas para trabalhar.
-            #
-            # Se páginas posteriores falharem,
-            # também interrompemos a consulta
-            # para evitar trabalhar com uma
-            # paginação incompleta sem avisar.
-            raise
-
-        quantidade = len(
-            ofertas
-        )
-
-        logger.info(
-            "Página %d: %d ofertas recebidas.",
-            pagina,
-            quantidade
-        )
-
-        todas_ofertas.extend(
-            ofertas
-        )
-
-        has_next_page = bool(
-            page_info.get(
-                "hasNextPage",
-                False
-            )
-        )
-
-        pagina_atual = page_info.get(
-            "page"
-        )
-
-        logger.info(
-            "PageInfo: page=%s, "
-            "hasNextPage=%s",
-            pagina_atual,
-            has_next_page
-        )
-
-        # ----------------------------------------------------
-        # NÃO HÁ MAIS PÁGINAS
-        # ----------------------------------------------------
-
-        if not has_next_page:
-
-            logger.info(
-                "Não existem mais páginas "
-                "disponíveis."
-            )
-
-            break
-
-        # ----------------------------------------------------
-        # PÁGINA VAZIA
-        # ----------------------------------------------------
-
-        if quantidade == 0:
-
-            logger.info(
-                "Página %d vazia. "
-                "Encerrando paginação.",
-                pagina
-            )
-
-            break
-
-        pagina += 1
-
-    # ========================================================
-    # REMOVER DUPLICADOS
-    # ========================================================
-
-    ofertas_unicas = []
-
-    ids_vistos = set()
-
-    for oferta in todas_ofertas:
-
-        item_id = oferta.get(
-            "itemId"
-        )
-
-        if item_id is None:
-
-            # Mantém produtos sem itemId.
-            # O bot.py decidirá depois
-            # se pode publicá-los.
-            ofertas_unicas.append(
-                oferta
-            )
-
-            continue
-
-        item_id = str(
+        logger.warning(
+            "Nenhum produto encontrado "
+            "para shopId=%s itemId=%s",
+            shop_id,
             item_id
         )
 
-        if item_id in ids_vistos:
+        return None
 
-            continue
-
-        ids_vistos.add(
-            item_id
-        )
-
-        ofertas_unicas.append(
-            oferta
-        )
+    produto = nodes[0]
 
     logger.info(
-        "Paginação finalizada: "
-        "%d ofertas recebidas em até %d páginas.",
-        len(todas_ofertas),
-        MAX_PAGINAS
+        "Produto encontrado: %s",
+        produto.get(
+            "productName"
+        )
     )
 
-    logger.info(
-        "Após remover duplicados: "
-        "%d ofertas únicas.",
-        len(ofertas_unicas)
+    return produto
+
+
+# ============================================================
+# BUSCAR PRODUTO POR LINK
+# ============================================================
+
+def buscar_produto_por_link(
+    link: str
+):
+
+    if not link:
+        raise ShopeeAPIError(
+            "Link vazio."
+        )
+
+    link = link.strip()
+
+    # --------------------------------------------------------
+    # 1. Resolver short link
+    # --------------------------------------------------------
+
+    url_final = resolver_link(
+        link
     )
 
-    return ofertas_unicas
+    # --------------------------------------------------------
+    # 2. Extrair IDs
+    # --------------------------------------------------------
+
+    shop_id, item_id = (
+        extrair_ids_da_url(
+            url_final
+        )
+    )
+
+    # --------------------------------------------------------
+    # 3. Consultar produto
+    # --------------------------------------------------------
+
+    produto = buscar_produto_por_ids(
+        shop_id=shop_id,
+        item_id=item_id
+    )
+
+    if not produto:
+
+        raise ShopeeAPIError(
+            "O produto não foi encontrado "
+            "na API de Afiliados."
+        )
+
+    # --------------------------------------------------------
+    # 4. GARANTIR O LINK DE AFILIADO
+    #
+    # O botão usará o link que você colocou
+    # manualmente.
+    # --------------------------------------------------------
+
+    produto["manualAffiliateLink"] = link
+
+    return produto
