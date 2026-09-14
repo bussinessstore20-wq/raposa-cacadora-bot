@@ -202,8 +202,8 @@ def extrair_ids_da_url(
         item_id = match.group(2)
 
         logger.info(
-            "IDs encontrados no formato "
-            "-i: shopId=%s | itemId=%s",
+            "IDs encontrados no formato -i: "
+            "shopId=%s | itemId=%s",
             shop_id,
             item_id
         )
@@ -231,8 +231,8 @@ def extrair_ids_da_url(
         item_id = match.group(2)
 
         logger.info(
-            "IDs encontrados no formato "
-            "product: shopId=%s | itemId=%s",
+            "IDs encontrados no formato product: "
+            "shopId=%s | itemId=%s",
             shop_id,
             item_id
         )
@@ -243,12 +243,9 @@ def extrair_ids_da_url(
         )
 
     # ========================================================
-    # FORMATO DA SHOPEE:
+    # FORMATO:
     #
     # /opaanlp/1022739284/20299032787
-    #
-    # shopId = 1022739284
-    # itemId = 20299032787
     # ========================================================
 
     partes = [
@@ -261,8 +258,6 @@ def extrair_ids_da_url(
         "Segmentos encontrados: %s",
         partes
     )
-
-    # Procura dois números consecutivos.
 
     for i in range(
         len(partes) - 1
@@ -292,7 +287,7 @@ def extrair_ids_da_url(
             )
 
     # ========================================================
-    # FORMATO COM QUERY STRING
+    # FORMATO:
     #
     # ?shopid=123456&itemid=789012
     # ========================================================
@@ -302,27 +297,15 @@ def extrair_ids_da_url(
     )
 
     shop_values = (
-        parametros.get(
-            "shopid"
-        )
-        or parametros.get(
-            "shopId"
-        )
-        or parametros.get(
-            "shop_id"
-        )
+        parametros.get("shopid")
+        or parametros.get("shopId")
+        or parametros.get("shop_id")
     )
 
     item_values = (
-        parametros.get(
-            "itemid"
-        )
-        or parametros.get(
-            "itemId"
-        )
-        or parametros.get(
-            "item_id"
-        )
+        parametros.get("itemid")
+        or parametros.get("itemId")
+        or parametros.get("item_id")
     )
 
     if (
@@ -347,8 +330,6 @@ def extrair_ids_da_url(
 
     # ========================================================
     # ÚLTIMA TENTATIVA
-    #
-    # Procura qualquer par de números no caminho.
     # ========================================================
 
     numeros = re.findall(
@@ -362,8 +343,8 @@ def extrair_ids_da_url(
         item_id = numeros[-1]
 
         logger.info(
-            "IDs encontrados por expressão "
-            "numérica: shopId=%s | itemId=%s",
+            "IDs encontrados por expressão numérica: "
+            "shopId=%s | itemId=%s",
             shop_id,
             item_id
         )
@@ -374,12 +355,11 @@ def extrair_ids_da_url(
         )
 
     # ========================================================
-    # NÃO ENCONTROU
+    # ERRO
     # ========================================================
 
     logger.error(
-        "Não foi possível extrair "
-        "shopId/itemId."
+        "Não foi possível extrair shopId/itemId."
     )
 
     logger.error(
@@ -432,26 +412,26 @@ def _gerar_assinatura(
 
 def _graphql(
     query: str,
-    variables: dict
+    variables: dict | None = None
 ):
 
     app_id, secret = (
         _obter_credenciais()
     )
 
+    # ========================================================
+    # PAYLOAD
+    # ========================================================
+
     payload_obj = {
-        "query": query,
-        "variables": variables
+        "query": query
     }
 
-    # ========================================================
-    # O MESMO PAYLOAD GERADO AQUI É:
-    #
-    # 1. usado na assinatura
-    # 2. enviado no POST
-    #
-    # Não alterar depois da assinatura.
-    # ========================================================
+    if variables is not None:
+
+        payload_obj[
+            "variables"
+        ] = variables
 
     payload = json.dumps(
         payload_obj,
@@ -462,9 +442,17 @@ def _graphql(
         )
     )
 
+    # ========================================================
+    # TIMESTAMP
+    # ========================================================
+
     timestamp = int(
         time.time()
     )
+
+    # ========================================================
+    # ASSINATURA
+    # ========================================================
 
     assinatura = _gerar_assinatura(
         app_id=app_id,
@@ -496,22 +484,6 @@ def _graphql(
         payload
     )
 
-    logger.debug(
-        "GraphQL variables: %s",
-        json.dumps(
-            variables,
-            ensure_ascii=False
-        )
-    )
-
-    logger.debug(
-        "Tipos das variables: %s",
-        {
-            chave: type(valor).__name__
-            for chave, valor in variables.items()
-        }
-    )
-
     try:
 
         response = requests.post(
@@ -535,6 +507,10 @@ def _graphql(
         response.status_code
     )
 
+    # ========================================================
+    # HTTP
+    # ========================================================
+
     if response.status_code != 200:
 
         logger.error(
@@ -547,6 +523,10 @@ def _graphql(
             f"{response.status_code}: "
             f"{response.text[:1000]}"
         )
+
+    # ========================================================
+    # JSON
+    # ========================================================
 
     try:
 
@@ -602,31 +582,32 @@ def _graphql(
 #
 # IMPORTANTE:
 #
-# A API informou explicitamente que:
+# Os IDs são inseridos diretamente na query.
 #
-# shopId -> Int64
-# itemId -> Int64
+# NÃO usamos:
 #
-# Portanto NÃO usar Int aqui.
+#     $shopId: Int64
+#     $itemId: Int64
 #
-# O "!" torna os dois argumentos obrigatórios.
+# Isso elimina o problema de coerção de variável do
+# GraphQL da Shopee.
 #
 # ============================================================
 
-PRODUCT_QUERY = """
-query ProductOffer(
-    $shopId: Int64!,
-    $itemId: Int64!,
-    $page: Int,
-    $limit: Int
-) {
+def _montar_query_produto(
+    shop_id: int,
+    item_id: int
+):
+
+    return f"""
+query ProductOffer {{
     productOfferV2(
-        shopId: $shopId,
-        itemId: $itemId,
-        page: $page,
-        limit: $limit
-    ) {
-        nodes {
+        shopId: {shop_id},
+        itemId: {item_id},
+        page: 1,
+        limit: 1
+    ) {{
+        nodes {{
             productName
             itemId
             commissionRate
@@ -648,15 +629,54 @@ query ProductOffer(
             shopType
             sellerCommissionRate
             shopeeCommissionRate
-        }
+        }}
 
-        pageInfo {
+        pageInfo {{
             page
             limit
             hasNextPage
-        }
-    }
-}
+        }}
+    }}
+}}
+"""
+
+
+# ============================================================
+# QUERY MÍNIMA DE DIAGNÓSTICO
+# ============================================================
+#
+# Se a query completa falhar, podemos usar somente esses
+# campos para separar problema de filtro de problema de
+# algum campo do retorno.
+#
+# ============================================================
+
+def _montar_query_produto_minima(
+    shop_id: int,
+    item_id: int
+):
+
+    return f"""
+query ProductOffer {{
+    productOfferV2(
+        shopId: {shop_id},
+        itemId: {item_id},
+        page: 1,
+        limit: 1
+    ) {{
+        nodes {{
+            itemId
+            productName
+            shopId
+        }}
+
+        pageInfo {{
+            page
+            limit
+            hasNextPage
+        }}
+    }}
+}}
 """
 
 
@@ -677,7 +697,7 @@ def buscar_produto_por_ids(
     )
 
     # ========================================================
-    # CONVERTER IDs
+    # CONVERTER
     # ========================================================
 
     try:
@@ -701,7 +721,7 @@ def buscar_produto_por_ids(
         ) from erro
 
     # ========================================================
-    # VALIDAR IDs
+    # VALIDAR
     # ========================================================
 
     if shop_id_int <= 0:
@@ -724,43 +744,25 @@ def buscar_produto_por_ids(
     )
 
     # ========================================================
-    # VARIABLES GRAPHQL
-    #
-    # Int64!
-    #
-    # Enviamos como int Python.
-    # json.dumps() vai gerar números JSON:
-    #
-    # {
-    #     "shopId": 1022739284,
-    #     "itemId": 20299032787
-    # }
-    #
+    # MONTAR QUERY
     # ========================================================
 
-    variables = {
-        "shopId": shop_id_int,
-        "itemId": item_id_int,
-        "page": 1,
-        "limit": 1
-    }
+    query = _montar_query_produto(
+        shop_id=shop_id_int,
+        item_id=item_id_int
+    )
 
-    logger.info(
-        "Variáveis GraphQL preparadas: "
-        "shopId=%s | itemId=%s | page=%s | limit=%s",
-        variables["shopId"],
-        variables["itemId"],
-        variables["page"],
-        variables["limit"]
+    logger.debug(
+        "Query do produto: %s",
+        query
     )
 
     # ========================================================
-    # CONSULTAR GRAPHQL
+    # CONSULTAR SEM VARIABLES
     # ========================================================
 
     resultado = _graphql(
-        query=PRODUCT_QUERY,
-        variables=variables
+        query=query
     )
 
     # ========================================================
@@ -789,7 +791,7 @@ def buscar_produto_por_ids(
     )
 
     # ========================================================
-    # NENHUM PRODUTO
+    # NENHUM RESULTADO
     # ========================================================
 
     if not nodes:
@@ -804,13 +806,13 @@ def buscar_produto_por_ids(
         return None
 
     # ========================================================
-    # PRIMEIRO PRODUTO
+    # PRODUTO
     # ========================================================
 
     produto = nodes[0]
 
     # ========================================================
-    # GARANTIR OS IDs
+    # GARANTIR IDS
     # ========================================================
 
     if not produto.get(
@@ -875,7 +877,7 @@ def buscar_produto_por_link(
     link = link.strip()
 
     # ========================================================
-    # RESOLVER LINK
+    # RESOLVER
     # ========================================================
 
     url_final = resolver_link(
@@ -883,7 +885,7 @@ def buscar_produto_por_link(
     )
 
     # ========================================================
-    # EXTRAIR IDs
+    # EXTRAIR IDS
     # ========================================================
 
     shop_id, item_id = (
@@ -900,13 +902,17 @@ def buscar_produto_por_link(
     )
 
     # ========================================================
-    # CONSULTAR API
+    # CONSULTAR
     # ========================================================
 
     produto = buscar_produto_por_ids(
         shop_id=shop_id,
         item_id=item_id
     )
+
+    # ========================================================
+    # NÃO ENCONTROU
+    # ========================================================
 
     if not produto:
 
@@ -917,9 +923,6 @@ def buscar_produto_por_link(
 
     # ========================================================
     # PRESERVAR LINK ORIGINAL
-    #
-    # O Telegram continuará usando o link que
-    # foi originalmente enviado para o bot.
     # ========================================================
 
     produto[
