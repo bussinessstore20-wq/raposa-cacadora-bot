@@ -2,6 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import threading
+from http.server import BaseHTTPRequestHandler
+from http.server import HTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -45,20 +48,37 @@ INTERVALO_MINUTOS = int(
 
 
 # ============================================================
-# LINKS MANUAIS
+# PORTA DO RENDER
+# ============================================================
+
+PORT = int(
+    os.getenv(
+        "PORT",
+        "10000"
+    )
+)
+
+
+# ============================================================
+# LINKS DOS PRODUTOS
 # ============================================================
 #
-# COLE SEUS LINKS AQUI.
+# COLOQUE ATÉ 20 LINKS.
 #
-# A ordem determina a ordem das publicações.
+# O bot publica na ordem:
 #
-# ATÉ 20 LINKS.
+# 1 -> espera 10 minutos
+# 2 -> espera 10 minutos
+# 3 -> etc.
 #
+# ============================================================
 
 LINKS_PRODUTOS = [
 
     "https://s.shopee.com.br/1qbmEw9Aek",
 
+    # Cole os outros links abaixo:
+    #
     # "https://s.shopee.com.br/SEU_LINK_02",
     # "https://s.shopee.com.br/SEU_LINK_03",
     # "https://s.shopee.com.br/SEU_LINK_04",
@@ -82,7 +102,7 @@ LINKS_PRODUTOS = [
 
 
 # ============================================================
-# ESTADO
+# ARQUIVO DE ESTADO
 # ============================================================
 
 ARQUIVO_ESTADO = Path(
@@ -110,7 +130,62 @@ logger = logging.getLogger(
 
 
 # ============================================================
-# VALIDAÇÃO
+# SERVIDOR HTTP PARA O RENDER
+# ============================================================
+
+class HealthHandler(
+    BaseHTTPRequestHandler
+):
+
+    def do_GET(
+        self
+    ):
+
+        self.send_response(
+            200
+        )
+
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8"
+        )
+
+        self.end_headers()
+
+        self.wfile.write(
+            b"Raposa Cacadora OK"
+        )
+
+    def log_message(
+        self,
+        format,
+        *args
+    ):
+
+        # Não poluir o log do bot.
+        return
+
+
+def iniciar_servidor_http():
+
+    servidor = HTTPServer(
+        (
+            "0.0.0.0",
+            PORT
+        ),
+        HealthHandler
+    )
+
+    logger.info(
+        "Servidor HTTP iniciado na porta %d",
+        PORT
+    )
+
+    servidor.serve_forever()
+
+
+# ============================================================
+# CONFIGURAÇÃO
 # ============================================================
 
 def validar_configuracao():
@@ -132,13 +207,16 @@ def validar_configuracao():
     if INTERVALO_MINUTOS < 1:
 
         erros.append(
-            "INTERVALO_MINUTOS deve ser maior que 0."
+            "INTERVALO_MINUTOS deve ser "
+            "maior que 0."
         )
 
-    if len(LINKS_PRODUTOS) > 20:
+    if len(
+        LINKS_PRODUTOS
+    ) > 20:
 
         erros.append(
-            "Máximo permitido: 20 links."
+            "Máximo de 20 links."
         )
 
     links_validos = []
@@ -150,6 +228,7 @@ def validar_configuracao():
         ).strip()
 
         if not link:
+
             continue
 
         if not (
@@ -205,7 +284,7 @@ def validar_configuracao():
 
 
 # ============================================================
-# ESTADO DA FILA
+# ESTADO
 # ============================================================
 
 def carregar_indice():
@@ -239,8 +318,8 @@ def carregar_indice():
 
         logger.info(
             "Estado carregado. "
-            "Próximo índice: %d",
-            indice
+            "Próximo produto: %d",
+            indice + 1
         )
 
         return indice
@@ -248,8 +327,7 @@ def carregar_indice():
     except Exception as erro:
 
         logger.warning(
-            "Não foi possível carregar "
-            "o estado: %s",
+            "Erro ao carregar estado: %s",
             erro
         )
 
@@ -288,7 +366,7 @@ def salvar_indice(
         logger.info(
             "Estado salvo. "
             "Próximo índice: %d",
-            indice
+            indice + 1
         )
 
     except Exception as erro:
@@ -297,8 +375,6 @@ def salvar_indice(
             "Erro ao salvar estado: %s",
             erro
         )
-
-        raise
 
 
 # ============================================================
@@ -461,7 +537,7 @@ def montar_mensagem(
     )
 
     # --------------------------------------------------------
-    # PREÇO ATUAL
+    # PREÇO
     # --------------------------------------------------------
 
     preco_atual = preco
@@ -490,9 +566,7 @@ def montar_mensagem(
 
     else:
 
-        preco_anterior = (
-            preco_atual
-        )
+        preco_anterior = preco_atual
 
     # --------------------------------------------------------
     # MENSAGEM
@@ -525,7 +599,7 @@ def montar_mensagem(
 
 
 # ============================================================
-# PUBLICAR NO TELEGRAM
+# PUBLICAR
 # ============================================================
 
 async def publicar_produto(
@@ -557,7 +631,7 @@ async def publicar_produto(
     )
 
     # --------------------------------------------------------
-    # TENTAR IMAGEM
+    # IMAGEM
     # --------------------------------------------------------
 
     if image_url:
@@ -587,7 +661,7 @@ async def publicar_produto(
             )
 
     # --------------------------------------------------------
-    # FALLBACK: TEXTO
+    # TEXTO
     # --------------------------------------------------------
 
     try:
@@ -610,7 +684,7 @@ async def publicar_produto(
     except Exception as erro:
 
         logger.exception(
-            "Erro ao publicar no Telegram: %s",
+            "Erro ao publicar produto: %s",
             erro
         )
 
@@ -618,7 +692,7 @@ async def publicar_produto(
 
 
 # ============================================================
-# PROCESSAR UM LINK
+# PROCESSAR LINK
 # ============================================================
 
 async def processar_link(
@@ -643,10 +717,6 @@ async def processar_link(
         link
     )
 
-    # --------------------------------------------------------
-    # BUSCAR PRODUTO
-    # --------------------------------------------------------
-
     try:
 
         produto = await asyncio.to_thread(
@@ -666,7 +736,7 @@ async def processar_link(
     except Exception as erro:
 
         logger.exception(
-            "Erro inesperado ao buscar produto: %s",
+            "Erro inesperado: %s",
             erro
         )
 
@@ -680,10 +750,6 @@ async def processar_link(
 
         return False
 
-    # --------------------------------------------------------
-    # NOME
-    # --------------------------------------------------------
-
     logger.info(
         "Produto encontrado: %s",
         produto.get(
@@ -691,10 +757,6 @@ async def processar_link(
             "Produto"
         )
     )
-
-    # --------------------------------------------------------
-    # PUBLICAR
-    # --------------------------------------------------------
 
     sucesso = await publicar_produto(
         bot=bot,
@@ -706,10 +768,10 @@ async def processar_link(
 
 
 # ============================================================
-# MAIN
+# BOT PRINCIPAL
 # ============================================================
 
-async def main():
+async def executar_bot():
 
     logger.info(
         "🦊 RAPOSA CAÇADORA iniciando..."
@@ -723,10 +785,6 @@ async def main():
 
     indice = carregar_indice()
 
-    # --------------------------------------------------------
-    # PROTEGER ÍNDICE
-    # --------------------------------------------------------
-
     if indice < 0:
 
         indice = 0
@@ -735,23 +793,12 @@ async def main():
 
         indice = total
 
-    # --------------------------------------------------------
-    # FILA JÁ FINALIZADA
-    # --------------------------------------------------------
-
     if indice >= total:
 
         logger.info(
-            "=========================================="
-        )
-
-        logger.info(
-            "Todos os %d produtos já foram publicados.",
+            "Todos os %d produtos "
+            "já foram publicados.",
             total
-        )
-
-        logger.info(
-            "Não há mais produtos na fila."
         )
 
         return
@@ -761,10 +808,6 @@ async def main():
         indice + 1,
         total
     )
-
-    # --------------------------------------------------------
-    # TELEGRAM
-    # --------------------------------------------------------
 
     async with Bot(
         token=TELEGRAM_TOKEN
@@ -782,16 +825,15 @@ async def main():
         except Exception as erro:
 
             logger.exception(
-                "Não foi possível conectar "
-                "ao Telegram: %s",
+                "Erro ao conectar Telegram: %s",
                 erro
             )
 
             raise
 
-        # ----------------------------------------------------
+        # ====================================================
         # FILA
-        # ----------------------------------------------------
+        # ====================================================
 
         while indice < total:
 
@@ -819,8 +861,11 @@ async def main():
                 )
 
                 logger.info(
-                    "Produto publicado. "
-                    "Progresso: %d/%d.",
+                    "Produto publicado com sucesso."
+                )
+
+                logger.info(
+                    "Progresso: %d/%d",
                     indice,
                     total
                 )
@@ -840,13 +885,8 @@ async def main():
                     "O índice NÃO será avançado."
                 )
 
-                logger.info(
-                    "Tentarei novamente em %d minutos.",
-                    INTERVALO_MINUTOS
-                )
-
             # ------------------------------------------------
-            # FINALIZOU
+            # FIM DA FILA
             # ------------------------------------------------
 
             if indice >= total:
@@ -876,10 +916,37 @@ async def main():
     )
 
     logger.info(
-        "Total: %d/%d produtos.",
+        "Total publicado: %d/%d",
         indice,
         total
     )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+
+    # --------------------------------------------------------
+    # SERVIDOR HTTP
+    #
+    # Necessário porque estamos usando
+    # Render Web Service.
+    # --------------------------------------------------------
+
+    servidor_thread = threading.Thread(
+        target=iniciar_servidor_http,
+        daemon=True
+    )
+
+    servidor_thread.start()
+
+    # --------------------------------------------------------
+    # BOT
+    # --------------------------------------------------------
+
+    await executar_bot()
 
 
 # ============================================================
@@ -899,3 +966,13 @@ if __name__ == "__main__":
         logger.info(
             "🦊 Raposa Caçadora encerrada."
         )
+
+    except Exception as erro:
+
+        logger.exception(
+            "Erro fatal: %s",
+            erro
+
+        )
+
+        raise
