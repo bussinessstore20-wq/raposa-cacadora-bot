@@ -20,6 +20,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 
@@ -35,27 +36,27 @@ from shopee import (
 
 TELEGRAM_TOKEN = os.getenv(
     "TELEGRAM_TOKEN",
-    ""
+    "",
 ).strip()
 
 TELEGRAM_CHAT_ID = os.getenv(
     "TELEGRAM_CHAT_ID",
-    ""
+    "",
 ).strip()
 
 TELEGRAM_ADMIN_ID = os.getenv(
     "TELEGRAM_ADMIN_ID",
-    ""
+    "",
 ).strip()
 
 SUPABASE_URL = os.getenv(
     "SUPABASE_URL",
-    ""
+    "",
 ).strip()
 
 SUPABASE_KEY = os.getenv(
     "SUPABASE_KEY",
-    ""
+    "",
 ).strip()
 
 INTERVALO_MINUTOS = int(
@@ -71,6 +72,8 @@ PORT = int(
         "10000",
     )
 )
+
+MAX_LINKS_POR_ENVIO = 20
 
 
 # ============================================================
@@ -100,6 +103,7 @@ supabase: Client | None = None
 
 
 def iniciar_supabase():
+
     global supabase
 
     if not SUPABASE_URL:
@@ -120,6 +124,15 @@ def iniciar_supabase():
     logger.info(
         "Supabase conectado."
     )
+
+
+# ============================================================
+# CONTROLE DO BOT
+# ============================================================
+
+bot_ativo = True
+
+worker_task: asyncio.Task | None = None
 
 
 # ============================================================
@@ -274,7 +287,23 @@ def extrair_links(
 
     for parte in texto.split():
 
-        link = parte.strip()
+        link = (
+            parte
+            .strip()
+            .strip("<>")
+            .strip()
+        )
+
+        # Remove pontuação comum no final.
+        while link and link[-1] in (
+            ",",
+            ".",
+            ";",
+            ")",
+            "]",
+            "}",
+        ):
+            link = link[:-1]
 
         if not (
             link.startswith("http://")
@@ -282,23 +311,25 @@ def extrair_links(
         ):
             continue
 
+        link_lower = link.lower()
+
         if (
-            "shopee.com.br" in link
-            or "s.shopee.com.br" in link
+            "shopee.com.br" in link_lower
+            or "s.shopee.com.br" in link_lower
         ):
             links.append(link)
 
-    # Remove duplicados mantendo a ordem.
     resultado = []
-
     vistos = set()
 
     for link in links:
 
-        if link not in vistos:
+        chave = link.strip()
 
-            vistos.add(link)
-            resultado.append(link)
+        if chave not in vistos:
+
+            vistos.add(chave)
+            resultado.append(chave)
 
     return resultado
 
@@ -337,7 +368,6 @@ def inserir_links(
             )
 
             if resposta.data:
-
                 adicionados += 1
 
         except Exception as erro:
@@ -346,14 +376,12 @@ def inserir_links(
                 erro
             )
 
-            # Violação do índice UNIQUE.
+            texto = mensagem_erro.lower()
+
             if (
-                "duplicate"
-                in mensagem_erro.lower()
-                or "unique"
-                in mensagem_erro.lower()
-                or "23505"
-                in mensagem_erro
+                "duplicate" in texto
+                or "unique" in texto
+                or "23505" in mensagem_erro
             ):
 
                 duplicados += 1
@@ -370,9 +398,7 @@ def inserir_links(
                     link,
                 )
 
-                erros.append(
-                    link
-                )
+                erros.append(link)
 
     return (
         adicionados,
@@ -382,7 +408,7 @@ def inserir_links(
 
 
 # ============================================================
-# SUPABASE - BUSCAR PRÓXIMO
+# SUPABASE - BUSCAR PRÓXIMO PRODUTO
 # ============================================================
 
 def buscar_proximo_produto():
@@ -481,6 +507,7 @@ def marcar_publicado(
             TELEGRAM_CHAT_ID
         ),
         "published_at": agora,
+        "processing_at": None,
         "erro": None,
     }
 
@@ -505,7 +532,6 @@ def marcar_erro(
     if supabase is None:
         return
 
-    # Busca tentativa atual.
     resposta = (
         supabase
         .table("produtos_fila")
@@ -537,6 +563,7 @@ def marcar_erro(
                 "status": "error",
                 "tentativas": tentativas,
                 "erro": erro[:2000],
+                "processing_at": None,
             }
         )
         .eq("id", produto_id)
@@ -889,6 +916,34 @@ async def publicar_produto(
 
 
 # ============================================================
+# NOTIFICAÇÃO PARA ADMIN
+# ============================================================
+
+async def enviar_notificacao_admin(
+    bot: Bot,
+    texto: str,
+):
+
+    try:
+
+        await bot.send_message(
+            chat_id=int(
+                TELEGRAM_ADMIN_ID
+            ),
+            text=texto,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+    except Exception as erro:
+
+        logger.warning(
+            "Não foi possível notificar admin: %s",
+            erro,
+        )
+
+
+# ============================================================
 # PROCESSAR PRODUTO
 # ============================================================
 
@@ -914,10 +969,6 @@ async def processar_produto(
         link,
     )
 
-    # --------------------------------------------------------
-    # Reservar produto
-    # --------------------------------------------------------
-
     reservado = await asyncio.to_thread(
         marcar_processando,
         produto_id,
@@ -926,8 +977,7 @@ async def processar_produto(
     if not reservado:
 
         logger.info(
-            "Produto %s não pôde ser reservado. "
-            "Provavelmente outro processo assumiu.",
+            "Produto %s não pôde ser reservado.",
             produto_id,
         )
 
@@ -980,6 +1030,17 @@ async def processar_produto(
             produto_id,
         )
 
+        await enviar_notificacao_admin(
+            bot,
+            (
+                "✅ <b>PRODUTO PUBLICADO</b>\n"
+                "\n"
+                f"📦 <b>{produto.get('productName', 'Produto')}</b>\n"
+                f"🆔 Fila: <b>#{produto_id}</b>\n"
+                f"📨 Mensagem: <b>#{message_id}</b>"
+            ),
+        )
+
         return True
 
     except ShopeeAPIError as erro:
@@ -993,6 +1054,17 @@ async def processar_produto(
             marcar_erro,
             produto_id,
             str(erro),
+        )
+
+        await enviar_notificacao_admin(
+            bot,
+            (
+                "❌ <b>ERRO AO PROCESSAR PRODUTO</b>\n"
+                "\n"
+                f"🆔 Fila: <b>#{produto_id}</b>\n"
+                f"🔗 {link}\n"
+                f"⚠️ <b>{str(erro)[:1500]}</b>"
+            ),
         )
 
         return False
@@ -1010,38 +1082,78 @@ async def processar_produto(
             str(erro),
         )
 
+        await enviar_notificacao_admin(
+            bot,
+            (
+                "❌ <b>ERRO AO PROCESSAR PRODUTO</b>\n"
+                "\n"
+                f"🆔 Fila: <b>#{produto_id}</b>\n"
+                f"🔗 {link}\n"
+                f"⚠️ <b>{str(erro)[:1500]}</b>"
+            ),
+        )
+
         return False
 
 
 # ============================================================
-# NOTIFICAR ADMIN
+# TECLADO PRINCIPAL
 # ============================================================
 
-async def enviar_notificacao_admin(
-    bot: Bot,
-    texto: str,
+def teclado_controle():
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "▶️ INICIAR",
+                    callback_data="bot_iniciar",
+                ),
+                InlineKeyboardButton(
+                    "⏹️ STOP",
+                    callback_data="bot_stop",
+                ),
+            ],
+        ]
+    )
+
+
+# ============================================================
+# /START
+# ============================================================
+
+async def comando_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    try:
+    if not usuario_autorizado(update):
+        return
 
-        await bot.send_message(
-            chat_id=int(
-                TELEGRAM_ADMIN_ID
-            ),
-            text=texto,
-            parse_mode=ParseMode.HTML,
-        )
+    mensagem = (
+        "🦊 <b>RAPOSA CAÇADORA</b>\n"
+        "\n"
+        "Envie um ou vários links da Shopee "
+        "para colocar na fila.\n"
+        "\n"
+        f"📦 Máximo por envio: <b>{MAX_LINKS_POR_ENVIO}</b>\n"
+        f"⏱️ Intervalo: <b>{INTERVALO_MINUTOS} minutos</b>\n"
+        "\n"
+        "O bot salva tudo no Supabase, então "
+        "a fila continua mesmo se o Render reiniciar.\n"
+        "\n"
+        "Use os botões abaixo para controlar a publicação."
+    )
 
-    except Exception as erro:
-
-        logger.warning(
-            "Não foi possível notificar admin: %s",
-            erro,
-        )
+    await update.message.reply_text(
+        mensagem,
+        parse_mode=ParseMode.HTML,
+        reply_markup=teclado_controle(),
+    )
 
 
 # ============================================================
-# COMANDO /STATUS
+# /STATUS
 # ============================================================
 
 async def comando_status(
@@ -1101,23 +1213,31 @@ async def comando_status(
             == "error"
         )
 
+        estado = (
+            "🟢 ATIVO"
+            if bot_ativo
+            else "🔴 PARADO"
+        )
+
         mensagem = (
             "🦊 <b>RAPOSA CAÇADORA</b>\n"
             "\n"
             "📊 <b>STATUS DA FILA</b>\n"
             "\n"
+            f"🤖 Bot: <b>{estado}</b>\n"
             f"📦 Total: <b>{total}</b>\n"
             f"✅ Publicados: <b>{publicados}</b>\n"
             f"⏳ Aguardando: <b>{pendentes}</b>\n"
             f"🔄 Processando: <b>{processando}</b>\n"
             f"❌ Erros: <b>{erros}</b>\n"
             "\n"
-            f"⏱️ Intervalo: <b>{INTERVALO_MINUTOS} minutos</b>\n"
+            f"⏱️ Intervalo: <b>{INTERVALO_MINUTOS} minutos</b>"
         )
 
         await update.message.reply_text(
             mensagem,
             parse_mode=ParseMode.HTML,
+            reply_markup=teclado_controle(),
         )
 
     except Exception as erro:
@@ -1132,7 +1252,7 @@ async def comando_status(
 
 
 # ============================================================
-# COMANDO /FILA
+# /FILA
 # ============================================================
 
 async def comando_fila(
@@ -1152,7 +1272,7 @@ async def comando_fila(
             supabase
             .table("produtos_fila")
             .select(
-                "id,product_name,status,created_at"
+                "id,link,product_name,status,created_at"
             )
             .order("id", desc=False)
             .limit(100)
@@ -1198,16 +1318,28 @@ async def comando_fila(
                 or "Aguardando processamento"
             )
 
-            # Evita mensagens enormes.
             if len(nome) > 45:
-                nome = nome[:42] + "..."
+                nome = (
+                    nome[:42]
+                    + "..."
+                )
 
             linhas.append(
                 f"{simbolo} #{item['id']} — {nome}"
             )
 
+        texto = "\n".join(
+            linhas
+        )
+
+        if len(texto) > 4000:
+            texto = (
+                texto[:3950]
+                + "\n\n..."
+            )
+
         await update.message.reply_text(
-            "\n".join(linhas),
+            texto,
             parse_mode=ParseMode.HTML,
         )
 
@@ -1223,7 +1355,7 @@ async def comando_fila(
 
 
 # ============================================================
-# COMANDO /ERROS
+# /ERROS
 # ============================================================
 
 async def comando_erros(
@@ -1277,7 +1409,10 @@ async def comando_erros(
             )
 
             if len(erro) > 300:
-                erro = erro[:297] + "..."
+                erro = (
+                    erro[:297]
+                    + "..."
+                )
 
             linhas.append(
                 f"❌ <b>#{item['id']}</b>"
@@ -1293,8 +1428,18 @@ async def comando_erros(
 
             linhas.append("")
 
+        texto = "\n".join(
+            linhas
+        )
+
+        if len(texto) > 4000:
+            texto = (
+                texto[:3950]
+                + "\n\n..."
+            )
+
         await update.message.reply_text(
-            "\n".join(linhas),
+            texto,
             parse_mode=ParseMode.HTML,
         )
 
@@ -1310,7 +1455,7 @@ async def comando_erros(
 
 
 # ============================================================
-# COMANDO /RETRY
+# /RETRY
 # ============================================================
 
 async def comando_retry(
@@ -1346,11 +1491,17 @@ async def comando_retry(
         )
 
         await update.message.reply_text(
-            "🔄 <b>REPROCESSAMENTO</b>\n"
-            "\n"
-            f"✅ {quantidade} produto(s) "
-            "voltaram para a fila.",
-                )
+            (
+                "🔄 <b>REPROCESSAMENTO</b>\n"
+                "\n"
+                f"✅ {quantidade} produto(s) "
+                "voltaram para a fila.\n"
+                "\n"
+                "Use ▶️ INICIAR para liberar a publicação."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=teclado_controle(),
+        )
 
     except Exception as erro:
 
@@ -1364,7 +1515,160 @@ async def comando_retry(
 
 
 # ============================================================
-# RECEBER LINKS ENVIADOS PELO ADMIN
+# /STOP
+# ============================================================
+
+async def comando_stop(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    global bot_ativo
+
+    if not usuario_autorizado(update):
+        return
+
+    bot_ativo = False
+
+    logger.warning(
+        "Publicação pausada pelo administrador."
+    )
+
+    await update.message.reply_text(
+        (
+            "⏹️ <b>PUBLICAÇÃO PARADA</b>\n"
+            "\n"
+            "Nenhum novo produto será publicado.\n"
+            "Os produtos que já estão no Supabase "
+            "continuam na fila.\n"
+            "\n"
+            "▶️ Use /start ou o botão INICIAR "
+            "para continuar."
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=teclado_controle(),
+    )
+
+
+# ============================================================
+# /INICIAR
+# ============================================================
+
+async def comando_iniciar(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    global bot_ativo
+
+    if not usuario_autorizado(update):
+        return
+
+    bot_ativo = True
+
+    logger.info(
+        "Publicação iniciada pelo administrador."
+    )
+
+    await update.message.reply_text(
+        (
+            "▶️ <b>PUBLICAÇÃO INICIADA</b>\n"
+            "\n"
+            "A Raposa Caçadora voltou a processar "
+            "a fila do Supabase.\n"
+            "\n"
+            f"⏱️ Intervalo: <b>{INTERVALO_MINUTOS} minutos</b>"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=teclado_controle(),
+    )
+
+
+# ============================================================
+# BOTÕES
+# ============================================================
+
+async def callback_controle(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    global bot_ativo
+
+    query = update.callback_query
+
+    if query is None:
+        return
+
+    await query.answer()
+
+    if not usuario_autorizado(update):
+
+        await query.answer(
+            "Você não está autorizado.",
+            show_alert=True,
+        )
+
+        return
+
+    if query.data == "bot_stop":
+
+        bot_ativo = False
+
+        logger.warning(
+            "Publicação parada pelo botão STOP."
+        )
+
+        texto = (
+            "⏹️ <b>PUBLICAÇÃO PARADA</b>\n"
+            "\n"
+            "A fila permanece salva no Supabase.\n"
+            "Nenhum novo produto será publicado."
+        )
+
+    elif query.data == "bot_iniciar":
+
+        bot_ativo = True
+
+        logger.info(
+            "Publicação iniciada pelo botão."
+        )
+
+        texto = (
+            "▶️ <b>PUBLICAÇÃO INICIADA</b>\n"
+            "\n"
+            "A Raposa voltou a processar a fila."
+        )
+
+    else:
+
+        return
+
+    try:
+
+        await query.edit_message_text(
+            texto,
+            parse_mode=ParseMode.HTML,
+            reply_markup=teclado_controle(),
+        )
+
+    except Exception:
+
+        try:
+
+            await query.message.reply_text(
+                texto,
+                parse_mode=ParseMode.HTML,
+                reply_markup=teclado_controle(),
+            )
+
+        except Exception:
+
+            pass
+
+
+# ============================================================
+# RECEBER LINKS PELO TELEGRAM
 # ============================================================
 
 async def receber_links(
@@ -1375,135 +1679,14 @@ async def receber_links(
     if not usuario_autorizado(update):
         return
 
-    if not update.message:
+    if update.message is None:
         return
 
-    texto = update.message.text or ""
-
-    links = extrair_links(texto)
-
-    if not links:
-
-        await update.message.reply_text(
-            "⚠️ Nenhum link da Shopee foi encontrado."
-        )
-
-        return
-
-    logger.info(
-        "Recebidos %d link(s) pelo Telegram.",
-        len(links),
+    texto = (
+        update.message.text
+        or update.message.caption
+        or ""
     )
-
-    try:
-
-        adicionados, duplicados, erros = (
-            await asyncio.to_thread(
-                inserir_links,
-                links,
-            )
-        )
-
-        linhas = [
-            "🦊 <b>RAPOSA CAÇADORA</b>",
-            "",
-            "📥 <b>LINKS RECEBIDOS</b>",
-            "",
-            f"📦 Recebidos: <b>{len(links)}</b>",
-            f"⏳ Adicionados à fila: <b>{adicionados}</b>",
-            f"♻️ Já existentes: <b>{duplicados}</b>",
-            f"❌ Erros: <b>{len(erros)}</b>",
-            "",
-        ]
-
-        if adicionados:
-            linhas.append(
-                "✅ Os links foram recebidos e estão "
-                "aguardando publicação."
-            )
-
-        if erros:
-
-            linhas.append("")
-            linhas.append(
-                "⚠️ Links que apresentaram erro:"
-            )
-
-            for link in erros:
-
-                if len(link) > 80:
-                    link = link[:77] + "..."
-
-                linhas.append(
-                    f"• {link}"
-                )
-
-        await update.message.reply_text(
-            "\n".join(linhas),
-            parse_mode=ParseMode.HTML,
-        )
-
-        # ----------------------------------------------------
-        # Notificação administrativa adicional
-        # ----------------------------------------------------
-
-        await enviar_notificacao_admin(
-            context.bot,
-            (
-                "🦊 <b>FILA ATUALIZADA</b>\n"
-                "\n"
-                f"📥 Links recebidos: <b>{len(links)}</b>\n"
-                f"⏳ Adicionados: <b>{adicionados}</b>\n"
-                f"♻️ Duplicados: <b>{duplicados}</b>\n"
-                f"❌ Erros: <b>{len(erros)}</b>\n"
-                "\n"
-                "Os links adicionados estão aguardando "
-                "publicação automática."
-            ),
-        )
-
-    except Exception as erro:
-
-        logger.exception(
-            "Erro ao inserir links recebidos."
-        )
-
-        await update.message.reply_text(
-            "❌ <b>ERRO AO ADICIONAR LINKS</b>\n"
-            "\n"
-            f"{erro}",
-            parse_mode=ParseMode.HTML,
-        )
-
-
-# ============================================================
-# COMANDO /ADICIONAR
-# ============================================================
-
-async def comando_adicionar(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not usuario_autorizado(update):
-        return
-
-    if not update.message:
-        return
-
-    texto = " ".join(
-        context.args
-    )
-
-    if not texto:
-
-        await update.message.reply_text(
-            "📥 Envie o comando assim:\n\n"
-            "<code>/adicionar https://s.shopee.com.br/...</code>",
-            parse_mode=ParseMode.HTML,
-        )
-
-        return
 
     links = extrair_links(
         texto
@@ -1512,96 +1695,115 @@ async def comando_adicionar(
     if not links:
 
         await update.message.reply_text(
-            "⚠️ Nenhum link válido da Shopee encontrado."
+            (
+                "⚠️ Não encontrei links da Shopee.\n\n"
+                "Envie um ou vários links, por exemplo:\n"
+                "https://s.shopee.com.br/..."
+            )
+        )
+
+        return
+
+    if len(links) > MAX_LINKS_POR_ENVIO:
+
+        await update.message.reply_text(
+            (
+                f"⚠️ Você enviou <b>{len(links)}</b> links.\n\n"
+                f"O limite é <b>{MAX_LINKS_POR_ENVIO}</b> "
+                "links por envio.\n"
+                "\n"
+                "Envie em grupos menores."
+            ),
+            parse_mode=ParseMode.HTML,
         )
 
         return
 
     try:
 
-        adicionados, duplicados, erros = (
-            await asyncio.to_thread(
-                inserir_links,
-                links,
-            )
+        (
+            adicionados,
+            duplicados,
+            erros,
+        ) = await asyncio.to_thread(
+            inserir_links,
+            links,
         )
 
         mensagem = (
-            "🦊 <b>LINKS ADICIONADOS</b>\n"
+            "🦊 <b>LINKS RECEBIDOS</b>\n"
             "\n"
             f"📥 Recebidos: <b>{len(links)}</b>\n"
-            f"⏳ Na fila: <b>{adicionados}</b>\n"
-            f"♻️ Duplicados: <b>{duplicados}</b>\n"
+            f"⏳ Adicionados à fila: <b>{adicionados}</b>\n"
+            f"♻️ Já existentes: <b>{duplicados}</b>\n"
             f"❌ Erros: <b>{len(erros)}</b>\n"
+            "\n"
+            "Os links adicionados estão salvos no "
+            "<b>Supabase</b> e aguardando publicação."
         )
 
-        if adicionados:
+        if bot_ativo:
 
             mensagem += (
-                "\n✅ Os produtos estão aguardando "
-                "publicação automática."
+                "\n\n"
+                "🟢 A publicação está <b>ATIVA</b>."
+            )
+
+        else:
+
+            mensagem += (
+                "\n\n"
+                "🔴 A publicação está <b>PARADA</b>."
             )
 
         await update.message.reply_text(
             mensagem,
             parse_mode=ParseMode.HTML,
+            reply_markup=teclado_controle(),
         )
+
+        if erros:
+
+            await enviar_notificacao_admin(
+                context.bot,
+                (
+                    "⚠️ <b>ERRO AO ADICIONAR LINKS</b>\n"
+                    "\n"
+                    f"Recebidos: {len(links)}\n"
+                    f"Adicionados: {adicionados}\n"
+                    f"Duplicados: {duplicados}\n"
+                    f"Com erro: {len(erros)}"
+                ),
+            )
 
     except Exception as erro:
 
         logger.exception(
-            "Erro no comando /adicionar."
+            "Erro ao adicionar links."
         )
 
         await update.message.reply_text(
-            f"❌ Erro ao adicionar links:\n{erro}"
+            (
+                "❌ <b>ERRO AO SALVAR LINKS</b>\n"
+                "\n"
+                f"{str(erro)[:2000]}"
+            ),
+            parse_mode=ParseMode.HTML,
         )
 
 
 # ============================================================
-# COMANDO /AJUDA
+# WORKER DA FILA
 # ============================================================
 
-async def comando_ajuda(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not usuario_autorizado(update):
-        return
-
-    mensagem = (
-        "🦊 <b>RAPOSA CAÇADORA</b>\n"
-        "\n"
-        "📋 <b>COMANDOS</b>\n"
-        "\n"
-        "📊 /status — mostra o status da fila\n"
-        "📋 /fila — mostra os produtos\n"
-        "⚠️ /erros — mostra os produtos com erro\n"
-        "🔄 /retry — coloca os erros novamente na fila\n"
-        "📥 /adicionar — adiciona um link manualmente\n"
-        "❓ /ajuda — mostra esta mensagem\n"
-        "\n"
-        "💡 Você também pode simplesmente enviar "
-        "20 ou mais links em uma única mensagem."
-    )
-
-    await update.message.reply_text(
-        mensagem,
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ============================================================
-# TRABALHADOR DA FILA
-# ============================================================
-
-async def trabalhador_fila(
+async def worker_fila(
     bot: Bot,
 ):
 
+    global bot_ativo
+
     logger.info(
-        "🦊 Trabalhador da fila iniciado."
+        "Worker da fila iniciado."
     )
 
     while True:
@@ -1609,20 +1811,29 @@ async def trabalhador_fila(
         try:
 
             # ------------------------------------------------
-            # Recuperar produtos que ficaram presos em
-            # processing após reinício do Render.
+            # STOP
+            # ------------------------------------------------
+
+            if not bot_ativo:
+
+                await asyncio.sleep(2)
+
+                continue
+
+            # ------------------------------------------------
+            # Recuperar produtos presos
             # ------------------------------------------------
 
             await asyncio.to_thread(
-                recuperar_processamentos_presos
+                recuperar_processamentos_presos,
             )
 
             # ------------------------------------------------
-            # Buscar próximo produto.
+            # Buscar próximo
             # ------------------------------------------------
 
             produto = await asyncio.to_thread(
-                buscar_proximo_produto
+                buscar_proximo_produto,
             )
 
             if not produto:
@@ -1632,9 +1843,7 @@ async def trabalhador_fila(
                     "Aguardando novos links..."
                 )
 
-                await asyncio.sleep(
-                    30
-                )
+                await asyncio.sleep(10)
 
                 continue
 
@@ -1648,74 +1857,56 @@ async def trabalhador_fila(
             )
 
             # ------------------------------------------------
-            # Sucesso
+            # STOP pode ter sido acionado
+            # ------------------------------------------------
+
+            if not bot_ativo:
+
+                continue
+
+            # ------------------------------------------------
+            # Se publicou, espera intervalo.
+            #
+            # Se deu erro, espera apenas alguns segundos
+            # para não ficar martelando a API.
             # ------------------------------------------------
 
             if sucesso:
 
                 logger.info(
-                    "Produto publicado. "
-                    "Próxima publicação em %d minutos.",
+                    "Aguardando %d minutos "
+                    "para o próximo produto...",
                     INTERVALO_MINUTOS,
                 )
 
-                await enviar_notificacao_admin(
-                    bot,
-                    (
-                        "✅ <b>PRODUTO PUBLICADO</b>\n"
-                        "\n"
-                        f"📦 ID da fila: <b>{produto['id']}</b>\n"
-                        "\n"
-                        f"⏱️ Próximo produto em "
-                        f"<b>{INTERVALO_MINUTOS} minutos</b>."
-                    ),
-                )
-
-                # ------------------------------------------------
-                # Aguardar somente depois de publicar com sucesso.
-                # ------------------------------------------------
-
-                await asyncio.sleep(
+                for _ in range(
                     INTERVALO_MINUTOS * 60
-                )
+                ):
 
-            # ------------------------------------------------
-            # Erro
-            # ------------------------------------------------
+                    if not bot_ativo:
+                        break
+
+                    await asyncio.sleep(1)
 
             else:
 
                 logger.warning(
-                    "Produto %s apresentou erro.",
-                    produto["id"],
+                    "Produto apresentou erro. "
+                    "Aguardando 30 segundos antes "
+                    "de verificar a fila novamente."
                 )
 
-                await enviar_notificacao_admin(
-                    bot,
-                    (
-                        "❌ <b>ERRO AO PUBLICAR PRODUTO</b>\n"
-                        "\n"
-                        f"📦 ID da fila: <b>{produto['id']}</b>\n"
-                        f"🔗 {produto['link']}\n"
-                        "\n"
-                        "⚠️ O produto foi marcado como erro.\n"
-                        "Use /erros para consultar.\n"
-                        "Use /retry para tentar novamente."
-                    ),
-                )
+                for _ in range(30):
 
-                # ------------------------------------------------
-                # Pequena pausa para evitar loop rápido de erros.
-                # ------------------------------------------------
+                    if not bot_ativo:
+                        break
 
-                await asyncio.sleep(
-                    30
-                )
+                    await asyncio.sleep(1)
 
         except asyncio.CancelledError:
 
             logger.info(
-                "Trabalhador da fila encerrado."
+                "Worker da fila cancelado."
             )
 
             raise
@@ -1723,7 +1914,8 @@ async def trabalhador_fila(
         except Exception as erro:
 
             logger.exception(
-                "Erro inesperado no trabalhador da fila."
+                "Erro no worker da fila: %s",
+                erro,
             )
 
             try:
@@ -1731,50 +1923,76 @@ async def trabalhador_fila(
                 await enviar_notificacao_admin(
                     bot,
                     (
-                        "🚨 <b>ERRO NO TRABALHADOR</b>\n"
+                        "🚨 <b>ERRO NO WORKER</b>\n"
                         "\n"
-                        f"{str(erro)[:2000]}\n"
+                        f"{str(erro)[:1500]}\n"
                         "\n"
-                        "🔄 O sistema continuará tentando."
+                        "O worker tentará continuar automaticamente."
                     ),
                 )
 
             except Exception:
                 pass
 
-            await asyncio.sleep(
-                30
-            )
+            await asyncio.sleep(30)
 
 
 # ============================================================
-# POST INIT DO TELEGRAM
+# INICIAR WORKER
+# ============================================================
+
+async def iniciar_worker(
+    application: Application,
+):
+
+    global worker_task
+
+    if worker_task is not None:
+
+        if not worker_task.done():
+            return
+
+    worker_task = asyncio.create_task(
+        worker_fila(
+            application.bot
+        )
+    )
+
+    logger.info(
+        "Worker criado."
+    )
+
+
+# ============================================================
+# POST INIT
 # ============================================================
 
 async def post_init(
     application: Application,
 ):
 
-    logger.info(
-        "Telegram Application iniciado."
-    )
+    await application.bot.initialize()
 
-    # --------------------------------------------------------
-    # Criar tarefa permanente da fila.
-    # --------------------------------------------------------
+    try:
 
-    bot = application.bot
+        me = await application.bot.get_me()
 
-    application.bot_data[
-        "worker_task"
-    ] = asyncio.create_task(
-        trabalhador_fila(
-            bot
+        logger.info(
+            "Telegram conectado: @%s",
+            me.username,
         )
-    )
 
-    logger.info(
-        "Trabalhador da fila iniciado pelo Telegram."
+    except Exception as erro:
+
+        logger.exception(
+            "Erro ao conectar Telegram: %s",
+            erro,
+        )
+
+        raise
+
+    await iniciar_worker(
+        application
     )
 
 
@@ -1786,32 +2004,61 @@ async def post_shutdown(
     application: Application,
 ):
 
-    tarefa = application.bot_data.get(
-        "worker_task"
+    global worker_task
+
+    if worker_task is not None:
+
+        if not worker_task.done():
+
+            logger.info(
+                "Cancelando worker..."
+            )
+
+            worker_task.cancel()
+
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+    worker_task = None
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    logger.info(
+        "🦊 RAPOSA CAÇADORA iniciando..."
     )
 
-    if tarefa:
+    validar_configuracao()
 
-        logger.info(
-            "Encerrando trabalhador da fila..."
-        )
+    iniciar_supabase()
 
-        tarefa.cancel()
+    # --------------------------------------------------------
+    # Recuperar produtos que eventualmente ficaram
+    # como processing antes de um reinício.
+    # --------------------------------------------------------
 
-        try:
+    recuperar_processamentos_presos()
 
-            await tarefa
+    # --------------------------------------------------------
+    # Servidor HTTP do Render
+    # --------------------------------------------------------
 
-        except asyncio.CancelledError:
+    servidor_thread = threading.Thread(
+        target=iniciar_servidor_http,
+        daemon=True,
+    )
 
-            pass
+    servidor_thread.start()
 
-
-# ============================================================
-# CONSTRUIR APPLICATION
-# ============================================================
-
-def criar_application():
+    # --------------------------------------------------------
+    # Aplicação Telegram
+    # --------------------------------------------------------
 
     application = (
         Application.builder()
@@ -1824,6 +2071,13 @@ def criar_application():
     # --------------------------------------------------------
     # COMANDOS
     # --------------------------------------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            comando_start,
+        )
+    )
 
     application.add_handler(
         CommandHandler(
@@ -1855,20 +2109,30 @@ def criar_application():
 
     application.add_handler(
         CommandHandler(
-            "adicionar",
-            comando_adicionar,
+            "stop",
+            comando_stop,
         )
     )
 
     application.add_handler(
         CommandHandler(
-            "ajuda",
-            comando_ajuda,
+            "iniciar",
+            comando_iniciar,
         )
     )
 
     # --------------------------------------------------------
-    # LINKS ENVIADOS DIRETAMENTE
+    # BOTÕES
+    # --------------------------------------------------------
+
+    application.add_handler(
+        CallbackQueryHandler(
+            callback_controle,
+        )
+    )
+
+    # --------------------------------------------------------
+    # RECEBER LINKS
     # --------------------------------------------------------
 
     application.add_handler(
@@ -1879,80 +2143,13 @@ def criar_application():
         )
     )
 
-    return application
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
+    # --------------------------------------------------------
+    # START
+    # --------------------------------------------------------
 
     logger.info(
-        "=========================================="
+        "Bot Telegram iniciando polling..."
     )
-
-    logger.info(
-        "🦊 RAPOSA CAÇADORA iniciando..."
-    )
-
-    # --------------------------------------------------------
-    # Validar configuração
-    # --------------------------------------------------------
-
-    validar_configuracao()
-
-    # --------------------------------------------------------
-    # Supabase
-    # --------------------------------------------------------
-
-    iniciar_supabase()
-
-    # --------------------------------------------------------
-    # Recuperar produtos que eventualmente ficaram presos
-    # antes de iniciar o bot.
-    # --------------------------------------------------------
-
-    try:
-
-        recuperar_processamentos_presos()
-
-    except Exception as erro:
-
-        logger.warning(
-            "Não foi possível recuperar "
-            "processamentos presos: %s",
-            erro,
-        )
-
-    # --------------------------------------------------------
-    # Servidor HTTP para Render
-    # --------------------------------------------------------
-
-    servidor_thread = threading.Thread(
-        target=iniciar_servidor_http,
-        daemon=True,
-    )
-
-    servidor_thread.start()
-
-    # --------------------------------------------------------
-    # Telegram
-    # --------------------------------------------------------
-
-    application = criar_application()
-
-    logger.info(
-        "=========================================="
-    )
-
-    logger.info(
-        "Bot Telegram iniciando..."
-    )
-
-    # --------------------------------------------------------
-    # Run polling
-    # --------------------------------------------------------
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
