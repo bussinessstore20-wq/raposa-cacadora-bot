@@ -62,7 +62,7 @@ SUPABASE_KEY = os.getenv(
 INTERVALO_MINUTOS = int(
     os.getenv(
         "INTERVALO_MINUTOS",
-        "10",
+        "25",
     )
 )
 
