@@ -3,7 +3,7 @@ import logging
 import os
 import threading
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from supabase import create_client, Client
@@ -168,20 +168,29 @@ class HealthHandler(
 
 def iniciar_servidor_http():
 
-    servidor = HTTPServer(
-        (
-            "0.0.0.0",
+    try:
+
+        servidor = ThreadingHTTPServer(
+            (
+                "0.0.0.0",
+                PORT,
+            ),
+            HealthHandler,
+        )
+
+        logger.info(
+            "Servidor HTTP iniciado em 0.0.0.0:%d",
             PORT,
-        ),
-        HealthHandler,
-    )
+        )
 
-    logger.info(
-        "Servidor HTTP iniciado na porta %d",
-        PORT,
-    )
+        servidor.serve_forever()
 
-    servidor.serve_forever()
+    except Exception as erro:
+
+        logger.exception(
+            "Erro no servidor HTTP: %s",
+            erro,
+        )
 
 
 # ============================================================
@@ -232,8 +241,11 @@ def validar_configuracao():
         )
 
     try:
+
         int(TELEGRAM_ADMIN_ID)
+
     except ValueError:
+
         raise RuntimeError(
             "TELEGRAM_ADMIN_ID deve ser numérico."
         )
@@ -245,6 +257,11 @@ def validar_configuracao():
     logger.info(
         "Intervalo: %d minutos",
         INTERVALO_MINUTOS,
+    )
+
+    logger.info(
+        "Porta HTTP: %d",
+        PORT,
     )
 
 
@@ -260,10 +277,13 @@ def usuario_autorizado(
         return False
 
     try:
+
         admin_id = int(
             TELEGRAM_ADMIN_ID
         )
+
     except ValueError:
+
         return False
 
     return (
@@ -294,7 +314,6 @@ def extrair_links(
             .strip()
         )
 
-        # Remove pontuação comum no final.
         while link and link[-1] in (
             ",",
             ".",
@@ -657,6 +676,7 @@ def numero(
         )
 
     except Exception:
+
         return padrao
 
 
@@ -675,6 +695,7 @@ def inteiro(
         )
 
     except Exception:
+
         return padrao
 
 
@@ -1319,6 +1340,7 @@ async def comando_fila(
             )
 
             if len(nome) > 45:
+
                 nome = (
                     nome[:42]
                     + "..."
@@ -1333,6 +1355,7 @@ async def comando_fila(
         )
 
         if len(texto) > 4000:
+
             texto = (
                 texto[:3950]
                 + "\n\n..."
@@ -1409,6 +1432,7 @@ async def comando_erros(
             )
 
             if len(erro) > 300:
+
                 erro = (
                     erro[:297]
                     + "..."
@@ -1433,6 +1457,7 @@ async def comando_erros(
         )
 
         if len(texto) > 4000:
+
             texto = (
                 texto[:3950]
                 + "\n\n..."
@@ -1542,7 +1567,7 @@ async def comando_stop(
             "Os produtos que já estão no Supabase "
             "continuam na fila.\n"
             "\n"
-            "▶️ Use /start ou o botão INICIAR "
+            "▶️ Use /iniciar ou o botão INICIAR "
             "para continuar."
         ),
         parse_mode=ParseMode.HTML,
@@ -1550,6 +1575,37 @@ async def comando_stop(
     )
 
 
+# ============================================================
+# /INICIAR
+# ============================================================
+
+async def comando_iniciar(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    global bot_ativo
+
+    if not usuario_autorizado(update):
+        return
+
+    bot_ativo = True
+
+    logger.info(
+        "Publicação iniciada pelo administrador."
+    )
+
+    await update.message.reply_text(
+        (
+            "▶️ <b>PUBLICAÇÃO INICIADA</b>\n"
+            "\n"
+            "A Raposa Caçadora voltou a processar "
+            "a fila do Supabase.\n"
+            "\n"
+            f"⏱️ Intervalo: <b>{INTERVALO_MINUTOS} minutos</b>"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=teclado_controle(),
 # ============================================================
 # /INICIAR
 # ============================================================
@@ -1600,8 +1656,6 @@ async def callback_controle(
     if query is None:
         return
 
-    await query.answer()
-
     if not usuario_autorizado(update):
 
         await query.answer(
@@ -1610,6 +1664,8 @@ async def callback_controle(
         )
 
         return
+
+    await query.answer()
 
     if query.data == "bot_stop":
 
@@ -1623,7 +1679,9 @@ async def callback_controle(
             "⏹️ <b>PUBLICAÇÃO PARADA</b>\n"
             "\n"
             "A fila permanece salva no Supabase.\n"
-            "Nenhum novo produto será publicado."
+            "Nenhum novo produto será publicado.\n"
+            "\n"
+            "▶️ Pressione INICIAR para continuar."
         )
 
     elif query.data == "bot_iniciar":
@@ -1637,7 +1695,9 @@ async def callback_controle(
         texto = (
             "▶️ <b>PUBLICAÇÃO INICIADA</b>\n"
             "\n"
-            "A Raposa voltou a processar a fila."
+            "A Raposa voltou a processar a fila.\n"
+            "\n"
+            f"⏱️ Intervalo: <b>{INTERVALO_MINUTOS} minutos</b>"
         )
 
     else:
@@ -1656,11 +1716,13 @@ async def callback_controle(
 
         try:
 
-            await query.message.reply_text(
-                texto,
-                parse_mode=ParseMode.HTML,
-                reply_markup=teclado_controle(),
-            )
+            if query.message:
+
+                await query.message.reply_text(
+                    texto,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=teclado_controle(),
+                )
 
         except Exception:
 
@@ -1829,7 +1891,7 @@ async def worker_fila(
             )
 
             # ------------------------------------------------
-            # Buscar próximo
+            # Buscar próximo produto
             # ------------------------------------------------
 
             produto = await asyncio.to_thread(
@@ -1865,10 +1927,7 @@ async def worker_fila(
                 continue
 
             # ------------------------------------------------
-            # Se publicou, espera intervalo.
-            #
-            # Se deu erro, espera apenas alguns segundos
-            # para não ficar martelando a API.
+            # Se publicou, aguarda intervalo
             # ------------------------------------------------
 
             if sucesso:
@@ -1932,6 +1991,7 @@ async def worker_fila(
                 )
 
             except Exception:
+
                 pass
 
             await asyncio.sleep(30)
@@ -1950,6 +2010,11 @@ async def iniciar_worker(
     if worker_task is not None:
 
         if not worker_task.done():
+
+            logger.info(
+                "Worker já está em execução."
+            )
+
             return
 
     worker_task = asyncio.create_task(
@@ -1970,8 +2035,6 @@ async def iniciar_worker(
 async def post_init(
     application: Application,
 ):
-
-    await application.bot.initialize()
 
     try:
 
@@ -2017,11 +2080,18 @@ async def post_shutdown(
             worker_task.cancel()
 
             try:
+
                 await worker_task
+
             except asyncio.CancelledError:
+
                 pass
 
     worker_task = None
+
+    logger.info(
+        "Worker da fila finalizado."
+    )
 
 
 # ============================================================
@@ -2034,19 +2104,8 @@ def main():
         "🦊 RAPOSA CAÇADORA iniciando..."
     )
 
-    validar_configuracao()
-
-    iniciar_supabase()
-
     # --------------------------------------------------------
-    # Recuperar produtos que eventualmente ficaram
-    # como processing antes de um reinício.
-    # --------------------------------------------------------
-
-    recuperar_processamentos_presos()
-
-    # --------------------------------------------------------
-    # Servidor HTTP do Render
+    # SERVIDOR HTTP DO RENDER
     # --------------------------------------------------------
 
     servidor_thread = threading.Thread(
@@ -2057,7 +2116,21 @@ def main():
     servidor_thread.start()
 
     # --------------------------------------------------------
-    # Aplicação Telegram
+    # CONFIGURAÇÃO
+    # --------------------------------------------------------
+
+    validar_configuracao()
+
+    iniciar_supabase()
+
+    # --------------------------------------------------------
+    # RECUPERAR PROCESSAMENTOS PRESOS
+    # --------------------------------------------------------
+
+    recuperar_processamentos_presos()
+
+    # --------------------------------------------------------
+    # APLICAÇÃO TELEGRAM
     # --------------------------------------------------------
 
     application = (
@@ -2144,7 +2217,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # START
+    # START POLLING
     # --------------------------------------------------------
 
     logger.info(
