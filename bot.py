@@ -1,17 +1,16 @@
 import asyncio
 import logging
 import os
-import re
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 from supabase import create_client, Client
 
 from telegram import (
-    Update,
     Bot,
+    Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -59,11 +58,6 @@ SUPABASE_KEY = os.getenv(
     ""
 ).strip()
 
-
-# ============================================================
-# INTERVALO
-# ============================================================
-
 INTERVALO_MINUTOS = int(
     os.getenv(
         "INTERVALO_MINUTOS",
@@ -71,28 +65,12 @@ INTERVALO_MINUTOS = int(
     )
 )
 
-
-# ============================================================
-# PORTA DO RENDER
-# ============================================================
-
 PORT = int(
     os.getenv(
         "PORT",
         "10000",
     )
 )
-
-
-# ============================================================
-# CONFIGURAÇÃO DA FILA
-# ============================================================
-
-NOME_TABELA = "produtos_fila"
-
-# Se um produto ficar processing por mais que esse tempo,
-# consideramos que o processo morreu e devolvemos para pending.
-TIMEOUT_PROCESSING_MINUTOS = 30
 
 
 # ============================================================
@@ -126,12 +104,12 @@ def iniciar_supabase():
 
     if not SUPABASE_URL:
         raise RuntimeError(
-            "SUPABASE_URL não configurado."
+            "SUPABASE_URL não configurada."
         )
 
     if not SUPABASE_KEY:
         raise RuntimeError(
-            "SUPABASE_KEY não configurado."
+            "SUPABASE_KEY não configurada."
         )
 
     supabase = create_client(
@@ -144,15 +122,6 @@ def iniciar_supabase():
     )
 
 
-def obter_supabase() -> Client:
-    if supabase is None:
-        raise RuntimeError(
-            "Supabase ainda não foi inicializado."
-        )
-
-    return supabase
-
-
 # ============================================================
 # SERVIDOR HTTP PARA O RENDER
 # ============================================================
@@ -161,9 +130,8 @@ class HealthHandler(
     BaseHTTPRequestHandler
 ):
 
-    def do_GET(
-        self,
-    ):
+    def do_GET(self):
+
         self.send_response(200)
 
         self.send_header(
@@ -228,12 +196,12 @@ def validar_configuracao():
 
     if not SUPABASE_URL:
         erros.append(
-            "SUPABASE_URL não configurado."
+            "SUPABASE_URL não configurada."
         )
 
     if not SUPABASE_KEY:
         erros.append(
-            "SUPABASE_KEY não configurado."
+            "SUPABASE_KEY não configurada."
         )
 
     if INTERVALO_MINUTOS < 1:
@@ -254,7 +222,7 @@ def validar_configuracao():
         int(TELEGRAM_ADMIN_ID)
     except ValueError:
         raise RuntimeError(
-            "TELEGRAM_ADMIN_ID precisa ser numérico."
+            "TELEGRAM_ADMIN_ID deve ser numérico."
         )
 
     logger.info(
@@ -268,10 +236,10 @@ def validar_configuracao():
 
 
 # ============================================================
-# ADMIN
+# AUTORIZAÇÃO
 # ============================================================
 
-def usuario_e_admin(
+def usuario_autorizado(
     update: Update,
 ) -> bool:
 
@@ -291,292 +259,201 @@ def usuario_e_admin(
     )
 
 
-async def verificar_admin(
-    update: Update,
-) -> bool:
-
-    if usuario_e_admin(update):
-        return True
-
-    if update.effective_message:
-
-        await update.effective_message.reply_text(
-            "⛔ Você não tem permissão para "
-            "administrar a Raposa Caçadora."
-        )
-
-    return False
-
-
 # ============================================================
 # EXTRAIR LINKS
 # ============================================================
-
-PADRAO_URL = re.compile(
-    r"https?://[^\s<>\"]+",
-    re.IGNORECASE,
-)
-
 
 def extrair_links(
     texto: str,
 ) -> list[str]:
 
-    encontrados = PADRAO_URL.findall(
-        texto or ""
-    )
+    if not texto:
+        return []
 
     links = []
 
-    for link in encontrados:
+    for parte in texto.split():
 
-        link = link.strip()
+        link = parte.strip()
 
-        # Remove pontuação comum que pode vir no final.
-        link = link.rstrip(
-            ".,;:!?)]}>\"'"
-        )
-
-        if not link:
-            continue
-
-        link_lower = link.lower()
-
-        if (
-            "shopee.com.br" not in link_lower
-            and "s.shopee.com.br" not in link_lower
+        if not (
+            link.startswith("http://")
+            or link.startswith("https://")
         ):
             continue
 
-        if link not in links:
+        if (
+            "shopee.com.br" in link
+            or "s.shopee.com.br" in link
+        ):
             links.append(link)
 
-    return links
+    # Remove duplicados mantendo a ordem.
+    resultado = []
+
+    vistos = set()
+
+    for link in links:
+
+        if link not in vistos:
+
+            vistos.add(link)
+            resultado.append(link)
+
+    return resultado
 
 
 # ============================================================
-# SUPABASE - FUNÇÕES DE BANCO
+# SUPABASE - INSERIR LINKS
 # ============================================================
-
-def buscar_links_existentes(
-    links: list[str],
-) -> set[str]:
-
-    if not links:
-        return set()
-
-    cliente = obter_supabase()
-
-    resposta = (
-        cliente
-        .table(NOME_TABELA)
-        .select("link")
-        .in_("link", links)
-        .execute()
-    )
-
-    registros = resposta.data or []
-
-    return {
-        str(item["link"])
-        for item in registros
-        if item.get("link")
-    }
-
 
 def inserir_links(
     links: list[str],
-) -> tuple[int, int]:
+) -> tuple[int, int, list[str]]:
 
-    if not links:
-        return 0, 0
+    if supabase is None:
+        raise RuntimeError(
+            "Supabase não inicializado."
+        )
 
-    existentes = buscar_links_existentes(
-        links
+    adicionados = 0
+    duplicados = 0
+    erros = []
+
+    for link in links:
+
+        try:
+
+            resposta = (
+                supabase
+                .table("produtos_fila")
+                .insert(
+                    {
+                        "link": link,
+                        "status": "pending",
+                    }
+                )
+                .execute()
+            )
+
+            if resposta.data:
+
+                adicionados += 1
+
+        except Exception as erro:
+
+            mensagem_erro = str(
+                erro
+            )
+
+            # Violação do índice UNIQUE.
+            if (
+                "duplicate"
+                in mensagem_erro.lower()
+                or "unique"
+                in mensagem_erro.lower()
+                or "23505"
+                in mensagem_erro
+            ):
+
+                duplicados += 1
+
+                logger.info(
+                    "Link já existente: %s",
+                    link,
+                )
+
+            else:
+
+                logger.exception(
+                    "Erro ao inserir link: %s",
+                    link,
+                )
+
+                erros.append(
+                    link
+                )
+
+    return (
+        adicionados,
+        duplicados,
+        erros,
     )
 
-    novos = [
-        link
-        for link in links
-        if link not in existentes
-    ]
 
-    if not novos:
-        return 0, len(existentes)
+# ============================================================
+# SUPABASE - BUSCAR PRÓXIMO
+# ============================================================
 
-    registros = [
-        {
-            "link": link,
-            "status": "pending",
-            "tentativas": 0,
-        }
-        for link in novos
-    ]
+def buscar_proximo_produto():
 
-    cliente = obter_supabase()
-
-    try:
-
-        (
-            cliente
-            .table(NOME_TABELA)
-            .insert(registros)
-            .execute()
+    if supabase is None:
+        raise RuntimeError(
+            "Supabase não inicializado."
         )
-
-    except Exception as erro:
-
-        logger.exception(
-            "Erro ao inserir links no Supabase: %s",
-            erro,
-        )
-
-        # Pode ter ocorrido uma corrida de inserção.
-        # Verificamos novamente os existentes.
-        existentes_depois = buscar_links_existentes(
-            links
-        )
-
-        novos_reais = [
-            link
-            for link in links
-            if link in existentes_depois
-        ]
-
-        if len(novos_reais) == len(links):
-
-            return 0, len(existentes_depois)
-
-        raise
-
-    return len(novos), len(existentes)
-
-
-def recuperar_processamentos_presos():
-
-    cliente = obter_supabase()
-
-    agora = datetime.now(
-        timezone.utc
-    )
-
-    limite = agora.timestamp() - (
-        TIMEOUT_PROCESSING_MINUTOS * 60
-    )
-
-    limite_dt = datetime.fromtimestamp(
-        limite,
-        tz=timezone.utc,
-    ).isoformat()
-
-    try:
-
-        (
-            cliente
-            .table(NOME_TABELA)
-            .update(
-                {
-                    "status": "pending",
-                    "processing_at": None,
-                }
-            )
-            .eq(
-                "status",
-                "processing",
-            )
-            .lt(
-                "processing_at",
-                limite_dt,
-            )
-            .execute()
-        )
-
-        logger.info(
-            "Verificação de produtos presos concluída."
-        )
-
-    except Exception as erro:
-
-        logger.exception(
-            "Erro ao recuperar produtos presos: %s",
-            erro,
-        )
-
-
-def obter_proximo_produto():
-
-    cliente = obter_supabase()
 
     resposta = (
-        cliente
-        .table(NOME_TABELA)
+        supabase
+        .table("produtos_fila")
         .select("*")
-        .eq(
-            "status",
-            "pending",
-        )
-        .order(
-            "created_at",
-            desc=False,
-        )
-        .order(
-            "id",
-            desc=False,
-        )
+        .eq("status", "pending")
+        .order("created_at", desc=False)
         .limit(1)
         .execute()
     )
 
-    registros = resposta.data or []
-
-    if not registros:
+    if not resposta.data:
         return None
 
-    return registros[0]
+    return resposta.data[0]
 
 
-def marcar_processing(
+# ============================================================
+# SUPABASE - MARCAR PROCESSANDO
+# ============================================================
+
+def marcar_processando(
     produto_id: int,
 ) -> bool:
 
-    cliente = obter_supabase()
+    if supabase is None:
+        return False
 
     agora = datetime.now(
         timezone.utc
     ).isoformat()
 
     resposta = (
-        cliente
-        .table(NOME_TABELA)
+        supabase
+        .table("produtos_fila")
         .update(
             {
                 "status": "processing",
                 "processing_at": agora,
             }
         )
-        .eq(
-            "id",
-            produto_id,
-        )
-        .eq(
-            "status",
-            "pending",
-        )
+        .eq("id", produto_id)
+        .eq("status", "pending")
         .execute()
     )
 
-    registros = resposta.data or []
+    return bool(
+        resposta.data
+    )
 
-    return bool(registros)
 
+# ============================================================
+# SUPABASE - MARCAR PUBLICADO
+# ============================================================
 
 def marcar_publicado(
     produto_id: int,
     produto: dict[str, Any],
-    telegram_message_id: int | None = None,
+    telegram_message_id: int | None,
 ):
 
-    cliente = obter_supabase()
+    if supabase is None:
+        return
 
     agora = datetime.now(
         timezone.utc
@@ -584,9 +461,6 @@ def marcar_publicado(
 
     dados = {
         "status": "published",
-        "processing_at": None,
-        "published_at": agora,
-        "erro": None,
         "product_name": (
             produto.get("productName")
             or "Produto"
@@ -597,185 +471,1516 @@ def marcar_publicado(
         "item_id": produto.get(
             "itemId"
         ),
-        "image_url": (
-            produto.get("imageUrl")
-            or None
+        "image_url": produto.get(
+            "imageUrl"
         ),
+        "telegram_message_id": (
+            telegram_message_id
+        ),
+        "telegram_chat_id": (
+            TELEGRAM_CHAT_ID
+        ),
+        "published_at": agora,
+        "erro": None,
     }
 
-    if telegram_message_id is not None:
-        dados[
-            "telegram_message_id"
-        ] = telegram_message_id
-
     (
-        cliente
-        .table(NOME_TABELA)
+        supabase
+        .table("produtos_fila")
         .update(dados)
-        .eq(
-            "id",
-            produto_id,
-        )
+        .eq("id", produto_id)
         .execute()
     )
 
-    logger.info(
-        "Produto %d marcado como published.",
-        produto_id,
-    )
 
+# ============================================================
+# SUPABASE - MARCAR ERRO
+# ============================================================
 
 def marcar_erro(
     produto_id: int,
     erro: str,
 ):
 
-    cliente = obter_supabase()
+    if supabase is None:
+        return
+
+    # Busca tentativa atual.
+    resposta = (
+        supabase
+        .table("produtos_fila")
+        .select("tentativas")
+        .eq("id", produto_id)
+        .limit(1)
+        .execute()
+    )
+
+    tentativas = 0
+
+    if resposta.data:
+
+        tentativas = int(
+            resposta.data[0].get(
+                "tentativas",
+                0,
+            )
+            or 0
+        )
+
+    tentativas += 1
+
+    (
+        supabase
+        .table("produtos_fila")
+        .update(
+            {
+                "status": "error",
+                "tentativas": tentativas,
+                "erro": erro[:2000],
+            }
+        )
+        .eq("id", produto_id)
+        .execute()
+    )
+
+
+# ============================================================
+# SUPABASE - RECUPERAR PROCESSAMENTOS PRESOS
+# ============================================================
+
+def recuperar_processamentos_presos():
+
+    if supabase is None:
+        return
+
+    limite = (
+        datetime.now(
+            timezone.utc
+        )
+        - timedelta(
+            minutes=max(
+                INTERVALO_MINUTOS * 2,
+                20,
+            )
+        )
+    ).isoformat()
+
+    resposta = (
+        supabase
+        .table("produtos_fila")
+        .select("id")
+        .eq("status", "processing")
+        .lt("processing_at", limite)
+        .execute()
+    )
+
+    if not resposta.data:
+        return
+
+    for produto in resposta.data:
+
+        produto_id = produto["id"]
+
+        (
+            supabase
+            .table("produtos_fila")
+            .update(
+                {
+                    "status": "pending",
+                    "processing_at": None,
+                }
+            )
+            .eq("id", produto_id)
+            .eq("status", "processing")
+            .execute()
+        )
+
+        logger.warning(
+            "Produto %s recuperado de processing.",
+            produto_id,
+        )
+
+
+# ============================================================
+# NÚMEROS
+# ============================================================
+
+def numero(
+    valor,
+    padrao=0.0,
+):
 
     try:
 
-        (
-            cliente
-            .table(NOME_TABELA)
-            .update(
-                {
-                    "status": "error",
-                    "processing_at": None,
-                    "erro": erro[:2000],
-                }
+        if valor is None:
+            return padrao
+
+        texto = str(
+            valor
+        ).strip()
+
+        if not texto:
+            return padrao
+
+        return float(
+            texto.replace(
+                ",",
+                ".",
             )
-            .eq(
-                "id",
-                produto_id,
-            )
-            .execute()
         )
 
     except Exception:
-
-        logger.exception(
-            "Erro ao salvar status de erro "
-            "do produto %d.",
-            produto_id,
-        )
+        return padrao
 
 
-def incrementar_tentativas(
-    produto_id: int,
+def inteiro(
+    valor,
+    padrao=0,
 ):
 
-    cliente = obter_supabase()
+    try:
 
-    resposta = (
-        cliente
-        .table(NOME_TABELA)
-        .select("tentativas")
-        .eq(
-            "id",
-            produto_id,
+        if valor is None:
+            return padrao
+
+        return int(
+            float(valor)
         )
-        .limit(1)
-        .execute()
+
+    except Exception:
+        return padrao
+
+
+# ============================================================
+# MOEDA
+# ============================================================
+
+def moeda(
+    valor,
+):
+
+    valor = numero(
+        valor
     )
 
-    registros = resposta.data or []
-
-    if not registros:
-        return
-
-    atual = int(
-        registros[0].get(
-            "tentativas",
-            0,
-        )
-        or 0
+    texto = (
+        f"{valor:,.2f}"
+        .replace(",", "X")
+        .replace(".", ",")
+        .replace("X", ".")
     )
 
-    (
-        cliente
-        .table(NOME_TABELA)
-        .update(
-            {
-                "tentativas": atual + 1,
-            }
-        )
-        .eq(
-            "id",
-            produto_id,
-        )
-        .execute()
+    return f"R$ {texto}"
+
+
+# ============================================================
+# VENDAS
+# ============================================================
+
+def formatar_vendas(
+    vendas,
+):
+
+    vendas = inteiro(
+        vendas
     )
 
-
-def obter_ultimo_publicado():
-
-    cliente = obter_supabase()
-
-    resposta = (
-        cliente
-        .table(NOME_TABELA)
-        .select(
-            "published_at"
-        )
-        .eq(
-            "status",
-            "published",
-        )
-        .not_.is_(
-            "published_at",
-            "null",
-        )
-        .order(
-            "published_at",
-            desc=True,
-        )
-        .limit(1)
-        .execute()
-    )
-
-    registros = resposta.data or []
-
-    if not registros:
-        return None
-
-    return registros[0].get(
-        "published_at"
+    return (
+        f"{vendas:,}"
+        .replace(",", ".")
     )
 
 
-def obter_contagem_status():
+# ============================================================
+# MENSAGEM DO PRODUTO
+# ============================================================
 
-    cliente = obter_supabase()
+def montar_mensagem(
+    produto,
+):
 
-    resultado = {}
+    nome = (
+        produto.get(
+            "productName"
+        )
+        or "Produto"
+    )
 
-    for status in (
-        "pending",
-        "processing",
-        "published",
-        "error",
+    preco = numero(
+        produto.get(
+            "price"
+        )
+    )
+
+    preco_min = numero(
+        produto.get(
+            "priceMin"
+        )
+    )
+
+    desconto = numero(
+        produto.get(
+            "priceDiscountRate"
+        )
+    )
+
+    avaliacao = numero(
+        produto.get(
+            "ratingStar"
+        )
+    )
+
+    vendas = inteiro(
+        produto.get(
+            "sales"
+        )
+    )
+
+    loja = (
+        produto.get(
+            "shopName"
+        )
+        or "Loja Shopee"
+    )
+
+    preco_atual = preco
+
+    if preco_min > 0:
+        preco_atual = preco_min
+
+    if (
+        desconto > 0
+        and desconto < 100
+        and preco_atual > 0
     ):
 
+        preco_anterior = (
+            preco_atual
+            / (
+                1
+                - desconto / 100
+            )
+        )
+
+    else:
+
+        preco_anterior = preco_atual
+
+    mensagem = (
+        "🦊 <b>RAPOSA CAÇADORA</b>\n"
+        "\n"
+        "🔥 <b>OFERTA EM DESTAQUE</b>\n"
+        "\n"
+        f"✨ <b>{nome}</b>\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        f"❌ De: <s>{moeda(preco_anterior)}</s>\n"
+        f"💰 <b>Por apenas: {moeda(preco_atual)}</b>\n"
+        f"🏷️ <b>{desconto:.0f}% OFF</b>\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        f"⭐ <b>{avaliacao:.1f}</b>/5 de avaliação\n"
+        f"📦 <b>{formatar_vendas(vendas)}</b> vendas\n"
+        f"🏪 <b>{loja}</b>\n"
+        "\n"
+        "🚨 <b>Preço sujeito a alteração.</b>\n"
+        "⚡ Aproveite enquanto estiver disponível!"
+    )
+
+    return mensagem
+
+
+# ============================================================
+# PUBLICAR PRODUTO
+# ============================================================
+
+async def publicar_produto(
+    bot: Bot,
+    produto: dict[str, Any],
+    link_afiliado: str,
+):
+
+    mensagem = montar_mensagem(
+        produto
+    )
+
+    image_url = (
+        produto.get(
+            "imageUrl"
+        )
+        or ""
+    )
+
+    teclado = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🛒 COMPRAR AGORA",
+                    url=link_afiliado,
+                )
+            ]
+        ]
+    )
+
+    if image_url:
+
+        try:
+
+            mensagem_enviada = (
+                await bot.send_photo(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    photo=image_url,
+                    caption=mensagem,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=teclado,
+                )
+            )
+
+            logger.info(
+                "Produto publicado com imagem e botão."
+            )
+
+            return (
+                True,
+                mensagem_enviada.message_id,
+            )
+
+        except Exception as erro:
+
+            logger.warning(
+                "Falha ao enviar imagem: %s",
+                erro,
+            )
+
+    try:
+
+        mensagem_enviada = (
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=mensagem,
+                parse_mode=ParseMode.HTML,
+                reply_markup=teclado,
+                disable_web_page_preview=True,
+            )
+        )
+
+        logger.info(
+            "Produto publicado somente como texto."
+        )
+
+        return (
+            True,
+            mensagem_enviada.message_id,
+        )
+
+    except Exception as erro:
+
+        logger.exception(
+            "Erro ao publicar produto: %s",
+            erro,
+        )
+
+        return (
+            False,
+            None,
+        )
+
+
+# ============================================================
+# PROCESSAR PRODUTO
+# ============================================================
+
+async def processar_produto(
+    bot: Bot,
+    produto_fila: dict[str, Any],
+):
+
+    produto_id = produto_fila["id"]
+    link = produto_fila["link"]
+
+    logger.info(
+        "=========================================="
+    )
+
+    logger.info(
+        "Processando produto ID %s",
+        produto_id,
+    )
+
+    logger.info(
+        "Link: %s",
+        link,
+    )
+
+    # --------------------------------------------------------
+    # Reservar produto
+    # --------------------------------------------------------
+
+    reservado = await asyncio.to_thread(
+        marcar_processando,
+        produto_id,
+    )
+
+    if not reservado:
+
+        logger.info(
+            "Produto %s não pôde ser reservado. "
+            "Provavelmente outro processo assumiu.",
+            produto_id,
+        )
+
+        return False
+
+    try:
+
+        produto = await asyncio.to_thread(
+            buscar_produto_por_link,
+            link,
+        )
+
+        if not produto:
+
+            raise ShopeeAPIError(
+                "Produto não encontrado."
+            )
+
+        logger.info(
+            "Produto encontrado: %s",
+            produto.get(
+                "productName",
+                "Produto",
+            ),
+        )
+
+        sucesso, message_id = (
+            await publicar_produto(
+                bot=bot,
+                produto=produto,
+                link_afiliado=link,
+            )
+        )
+
+        if not sucesso:
+
+            raise RuntimeError(
+                "Falha ao publicar no Telegram."
+            )
+
+        await asyncio.to_thread(
+            marcar_publicado,
+            produto_id,
+            produto,
+            message_id,
+        )
+
+        logger.info(
+            "Produto %s marcado como publicado.",
+            produto_id,
+        )
+
+        return True
+
+    except ShopeeAPIError as erro:
+
+        logger.error(
+            "Erro da Shopee: %s",
+            erro,
+        )
+
+        await asyncio.to_thread(
+            marcar_erro,
+            produto_id,
+            str(erro),
+        )
+
+        return False
+
+    except Exception as erro:
+
+        logger.exception(
+            "Erro ao processar produto %s",
+            produto_id,
+        )
+
+        await asyncio.to_thread(
+            marcar_erro,
+            produto_id,
+            str(erro),
+        )
+
+        return False
+
+
+# ============================================================
+# NOTIFICAR ADMIN
+# ============================================================
+
+async def enviar_notificacao_admin(
+    bot: Bot,
+    texto: str,
+):
+
+    try:
+
+        await bot.send_message(
+            chat_id=int(
+                TELEGRAM_ADMIN_ID
+            ),
+            text=texto,
+            parse_mode=ParseMode.HTML,
+        )
+
+    except Exception as erro:
+
+        logger.warning(
+            "Não foi possível notificar admin: %s",
+            erro,
+        )
+
+
+# ============================================================
+# COMANDO /STATUS
+# ============================================================
+
+async def comando_status(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not usuario_autorizado(update):
+        return
+
+    if supabase is None:
+        return
+
+    try:
+
         resposta = (
-            cliente
-            .table(NOME_TABELA)
-            .select(
-                "id",
-                count="exact",
-            )
-            .eq(
-                "status",
-                status,
-            )
+            supabase
+            .table("produtos_fila")
+            .select("status")
             .execute()
         )
 
-        resultado[status] = (
-            resposta.count or 0
+        registros = (
+            resposta.data
+            or []
         )
 
-    resultado["total"] = sum(
-        resultado.values()
+        total = len(
+            registros
+        )
+
+        publicados = sum(
+            1
+            for item in registros
+            if item.get("status")
+            == "published"
+        )
+
+        pendentes = sum(
+            1
+            for item in registros
+            if item.get("status")
+            == "pending"
+        )
+
+        processando = sum(
+            1
+            for item in registros
+            if item.get("status")
+            == "processing"
+        )
+
+        erros = sum(
+            1
+            for item in registros
+            if item.get("status")
+            == "error"
+        )
+
+        mensagem = (
+            "🦊 <b>RAPOSA CAÇADORA</b>\n"
+            "\n"
+            "📊 <b>STATUS DA FILA</b>\n"
+            "\n"
+            f"📦 Total: <b>{total}</b>\n"
+            f"✅ Publicados: <b>{publicados}</b>\n"
+            f"⏳ Aguardando: <b>{pendentes}</b>\n"
+            f"🔄 Processando: <b>{processando}</b>\n"
+            f"❌ Erros: <b>{erros}</b>\n"
+            "\n"
+            f"⏱️ Intervalo: <b>{INTERVALO_MINUTOS} minutos</b>\n"
+        )
+
+        await update.message.reply_text(
+            mensagem,
+            parse_mode=ParseMode.HTML,
+        )
+
+    except Exception as erro:
+
+        logger.exception(
+            "Erro no comando /status"
+        )
+
+        await update.message.reply_text(
+            f"❌ Erro ao consultar status:\n{erro}"
+        )
+
+
+# ============================================================
+# COMANDO /FILA
+# ============================================================
+
+async def comando_fila(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not usuario_autorizado(update):
+        return
+
+    if supabase is None:
+        return
+
+    try:
+
+        resposta = (
+            supabase
+            .table("produtos_fila")
+            .select(
+                "id,product_name,status,created_at"
+            )
+            .order("id", desc=False)
+            .limit(100)
+            .execute()
+        )
+
+        registros = (
+            resposta.data
+            or []
+        )
+
+        if not registros:
+
+            await update.message.reply_text(
+                "🦊 A fila está vazia."
+            )
+
+            return
+
+        linhas = [
+            "🦊 <b>FILA DE PRODUTOS</b>",
+            "",
+        ]
+
+        simbolos = {
+            "pending": "⏳",
+            "processing": "🔄",
+            "published": "✅",
+            "error": "❌",
+        }
+
+        for item in registros:
+
+            simbolo = simbolos.get(
+                item.get("status"),
+                "❓",
+            )
+
+            nome = (
+                item.get(
+                    "product_name"
+                )
+                or "Aguardando processamento"
+            )
+
+            # Evita mensagens enormes.
+            if len(nome) > 45:
+                nome = nome[:42] + "..."
+
+            linhas.append(
+                f"{simbolo} #{item['id']} — {nome}"
+            )
+
+        await update.message.reply_text(
+            "\n".join(linhas),
+            parse_mode=ParseMode.HTML,
+        )
+
+    except Exception as erro:
+
+        logger.exception(
+            "Erro no comando /fila"
+        )
+
+        await update.message.reply_text(
+            f"❌ Erro ao consultar fila:\n{erro}"
+        )
+
+
+# ============================================================
+# COMANDO /ERROS
+# ============================================================
+
+async def comando_erros(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not usuario_autorizado(update):
+        return
+
+    if supabase is None:
+        return
+
+    try:
+
+        resposta = (
+            supabase
+            .table("produtos_fila")
+            .select(
+                "id,link,erro,tentativas"
+            )
+            .eq("status", "error")
+            .order("id", desc=False)
+            .limit(20)
+            .execute()
+        )
+
+        registros = (
+            resposta.data
+            or []
+        )
+
+        if not registros:
+
+            await update.message.reply_text(
+                "✅ Não existem produtos com erro."
+            )
+
+            return
+
+        linhas = [
+            "⚠️ <b>PRODUTOS COM ERRO</b>",
+            "",
+        ]
+
+        for item in registros:
+
+            erro = (
+                item.get("erro")
+                or "Erro desconhecido"
+            )
+
+            if len(erro) > 300:
+                erro = erro[:297] + "..."
+
+            linhas.append(
+                f"❌ <b>#{item['id']}</b>"
+            )
+
+            linhas.append(
+                f"Tentativas: {item.get('tentativas', 0)}"
+            )
+
+            linhas.append(
+                f"Erro: {erro}"
+            )
+
+            linhas.append("")
+
+        await update.message.reply_text(
+            "\n".join(linhas),
+            parse_mode=ParseMode.HTML,
+        )
+
+    except Exception as erro:
+
+        logger.exception(
+            "Erro no comando /erros"
+        )
+
+        await update.message.reply_text(
+            f"❌ Erro ao consultar erros:\n{erro}"
+        )
+
+
+# ============================================================
+# COMANDO /RETRY
+# ============================================================
+
+async def comando_retry(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not usuario_autorizado(update):
+        return
+
+    if supabase is None:
+        return
+
+    try:
+
+        resposta = (
+            supabase
+            .table("produtos_fila")
+            .update(
+                {
+                    "status": "pending",
+                    "erro": None,
+                    "processing_at": None,
+                }
+            )
+            .eq("status", "error")
+            .execute()
+        )
+
+        quantidade = len(
+            resposta.data
+            or []
+        )
+
+        await update.message.reply_text(
+            "🔄 <b>REPROCESSAMENTO</b>\n"
+            "\n"
+            f"✅ {quantidade} produto(s) "
+            "voltaram para a fila.",
+                )
+
+    except Exception as erro:
+
+        logger.exception(
+            "Erro no comando /retry"
+        )
+
+        await update.message.reply_text(
+            f"❌ Erro ao reprocessar:\n{erro}"
+        )
+
+
+# ============================================================
+# RECEBER LINKS ENVIADOS PELO ADMIN
+# ============================================================
+
+async def receber_links(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not usuario_autorizado(update):
+        return
+
+    if not update.message:
+        return
+
+    texto = update.message.text or ""
+
+    links = extrair_links(texto)
+
+    if not links:
+
+        await update.message.reply_text(
+            "⚠️ Nenhum link da Shopee foi encontrado."
+        )
+
+        return
+
+    logger.info(
+        "Recebidos %d link(s) pelo Telegram.",
+        len(links),
     )
 
-    return resultado
+    try:
+
+        adicionados, duplicados, erros = (
+            await asyncio.to_thread(
+                inserir_links,
+                links,
+            )
+        )
+
+        linhas = [
+            "🦊 <b>RAPOSA CAÇADORA</b>",
+            "",
+            "📥 <b>LINKS RECEBIDOS</b>",
+            "",
+            f"📦 Recebidos: <b>{len(links)}</b>",
+            f"⏳ Adicionados à fila: <b>{adicionados}</b>",
+            f"♻️ Já existentes: <b>{duplicados}</b>",
+            f"❌ Erros: <b>{len(erros)}</b>",
+            "",
+        ]
+
+        if adicionados:
+            linhas.append(
+                "✅ Os links foram recebidos e estão "
+                "aguardando publicação."
+            )
+
+        if erros:
+
+            linhas.append("")
+            linhas.append(
+                "⚠️ Links que apresentaram erro:"
+            )
+
+            for link in erros:
+
+                if len(link) > 80:
+                    link = link[:77] + "..."
+
+                linhas.append(
+                    f"• {link}"
+                )
+
+        await update.message.reply_text(
+            "\n".join(linhas),
+            parse_mode=ParseMode.HTML,
+        )
+
+        # ----------------------------------------------------
+        # Notificação administrativa adicional
+        # ----------------------------------------------------
+
+        await enviar_notificacao_admin(
+            context.bot,
+            (
+                "🦊 <b>FILA ATUALIZADA</b>\n"
+                "\n"
+                f"📥 Links recebidos: <b>{len(links)}</b>\n"
+                f"⏳ Adicionados: <b>{adicionados}</b>\n"
+                f"♻️ Duplicados: <b>{duplicados}</b>\n"
+                f"❌ Erros: <b>{len(erros)}</b>\n"
+                "\n"
+                "Os links adicionados estão aguardando "
+                "publicação automática."
+            ),
+        )
+
+    except Exception as erro:
+
+        logger.exception(
+            "Erro ao inserir links recebidos."
+        )
+
+        await update.message.reply_text(
+            "❌ <b>ERRO AO ADICIONAR LINKS</b>\n"
+            "\n"
+            f"{erro}",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ============================================================
+# COMANDO /ADICIONAR
+# ============================================================
+
+async def comando_adicionar(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not usuario_autorizado(update):
+        return
+
+    if not update.message:
+        return
+
+    texto = " ".join(
+        context.args
+    )
+
+    if not texto:
+
+        await update.message.reply_text(
+            "📥 Envie o comando assim:\n\n"
+            "<code>/adicionar https://s.shopee.com.br/...</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+        return
+
+    links = extrair_links(
+        texto
+    )
+
+    if not links:
+
+        await update.message.reply_text(
+            "⚠️ Nenhum link válido da Shopee encontrado."
+        )
+
+        return
+
+    try:
+
+        adicionados, duplicados, erros = (
+            await asyncio.to_thread(
+                inserir_links,
+                links,
+            )
+        )
+
+        mensagem = (
+            "🦊 <b>LINKS ADICIONADOS</b>\n"
+            "\n"
+            f"📥 Recebidos: <b>{len(links)}</b>\n"
+            f"⏳ Na fila: <b>{adicionados}</b>\n"
+            f"♻️ Duplicados: <b>{duplicados}</b>\n"
+            f"❌ Erros: <b>{len(erros)}</b>\n"
+        )
+
+        if adicionados:
+
+            mensagem += (
+                "\n✅ Os produtos estão aguardando "
+                "publicação automática."
+            )
+
+        await update.message.reply_text(
+            mensagem,
+            parse_mode=ParseMode.HTML,
+        )
+
+    except Exception as erro:
+
+        logger.exception(
+            "Erro no comando /adicionar."
+        )
+
+        await update.message.reply_text(
+            f"❌ Erro ao adicionar links:\n{erro}"
+        )
+
+
+# ============================================================
+# COMANDO /AJUDA
+# ============================================================
+
+async def comando_ajuda(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not usuario_autorizado(update):
+        return
+
+    mensagem = (
+        "🦊 <b>RAPOSA CAÇADORA</b>\n"
+        "\n"
+        "📋 <b>COMANDOS</b>\n"
+        "\n"
+        "📊 /status — mostra o status da fila\n"
+        "📋 /fila — mostra os produtos\n"
+        "⚠️ /erros — mostra os produtos com erro\n"
+        "🔄 /retry — coloca os erros novamente na fila\n"
+        "📥 /adicionar — adiciona um link manualmente\n"
+        "❓ /ajuda — mostra esta mensagem\n"
+        "\n"
+        "💡 Você também pode simplesmente enviar "
+        "20 ou mais links em uma única mensagem."
+    )
+
+    await update.message.reply_text(
+        mensagem,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ============================================================
+# TRABALHADOR DA FILA
+# ============================================================
+
+async def trabalhador_fila(
+    bot: Bot,
+):
+
+    logger.info(
+        "🦊 Trabalhador da fila iniciado."
+    )
+
+    while True:
+
+        try:
+
+            # ------------------------------------------------
+            # Recuperar produtos que ficaram presos em
+            # processing após reinício do Render.
+            # ------------------------------------------------
+
+            await asyncio.to_thread(
+                recuperar_processamentos_presos
+            )
+
+            # ------------------------------------------------
+            # Buscar próximo produto.
+            # ------------------------------------------------
+
+            produto = await asyncio.to_thread(
+                buscar_proximo_produto
+            )
+
+            if not produto:
+
+                logger.info(
+                    "Nenhum produto pendente. "
+                    "Aguardando novos links..."
+                )
+
+                await asyncio.sleep(
+                    30
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Processar
+            # ------------------------------------------------
+
+            sucesso = await processar_produto(
+                bot=bot,
+                produto_fila=produto,
+            )
+
+            # ------------------------------------------------
+            # Sucesso
+            # ------------------------------------------------
+
+            if sucesso:
+
+                logger.info(
+                    "Produto publicado. "
+                    "Próxima publicação em %d minutos.",
+                    INTERVALO_MINUTOS,
+                )
+
+                await enviar_notificacao_admin(
+                    bot,
+                    (
+                        "✅ <b>PRODUTO PUBLICADO</b>\n"
+                        "\n"
+                        f"📦 ID da fila: <b>{produto['id']}</b>\n"
+                        "\n"
+                        f"⏱️ Próximo produto em "
+                        f"<b>{INTERVALO_MINUTOS} minutos</b>."
+                    ),
+                )
+
+                # ------------------------------------------------
+                # Aguardar somente depois de publicar com sucesso.
+                # ------------------------------------------------
+
+                await asyncio.sleep(
+                    INTERVALO_MINUTOS * 60
+                )
+
+            # ------------------------------------------------
+            # Erro
+            # ------------------------------------------------
+
+            else:
+
+                logger.warning(
+                    "Produto %s apresentou erro.",
+                    produto["id"],
+                )
+
+                await enviar_notificacao_admin(
+                    bot,
+                    (
+                        "❌ <b>ERRO AO PUBLICAR PRODUTO</b>\n"
+                        "\n"
+                        f"📦 ID da fila: <b>{produto['id']}</b>\n"
+                        f"🔗 {produto['link']}\n"
+                        "\n"
+                        "⚠️ O produto foi marcado como erro.\n"
+                        "Use /erros para consultar.\n"
+                        "Use /retry para tentar novamente."
+                    ),
+                )
+
+                # ------------------------------------------------
+                # Pequena pausa para evitar loop rápido de erros.
+                # ------------------------------------------------
+
+                await asyncio.sleep(
+                    30
+                )
+
+        except asyncio.CancelledError:
+
+            logger.info(
+                "Trabalhador da fila encerrado."
+            )
+
+            raise
+
+        except Exception as erro:
+
+            logger.exception(
+                "Erro inesperado no trabalhador da fila."
+            )
+
+            try:
+
+                await enviar_notificacao_admin(
+                    bot,
+                    (
+                        "🚨 <b>ERRO NO TRABALHADOR</b>\n"
+                        "\n"
+                        f"{str(erro)[:2000]}\n"
+                        "\n"
+                        "🔄 O sistema continuará tentando."
+                    ),
+                )
+
+            except Exception:
+                pass
+
+            await asyncio.sleep(
+                30
+            )
+
+
+# ============================================================
+# POST INIT DO TELEGRAM
+# ============================================================
+
+async def post_init(
+    application: Application,
+):
+
+    logger.info(
+        "Telegram Application iniciado."
+    )
+
+    # --------------------------------------------------------
+    # Criar tarefa permanente da fila.
+    # --------------------------------------------------------
+
+    bot = application.bot
+
+    application.bot_data[
+        "worker_task"
+    ] = asyncio.create_task(
+        trabalhador_fila(
+            bot
+        )
+    )
+
+    logger.info(
+        "Trabalhador da fila iniciado pelo Telegram."
+    )
+
+
+# ============================================================
+# POST SHUTDOWN
+# ============================================================
+
+async def post_shutdown(
+    application: Application,
+):
+
+    tarefa = application.bot_data.get(
+        "worker_task"
+    )
+
+    if tarefa:
+
+        logger.info(
+            "Encerrando trabalhador da fila..."
+        )
+
+        tarefa.cancel()
+
+        try:
+
+            await tarefa
+
+        except asyncio.CancelledError:
+
+            pass
+
+
+# ============================================================
+# CONSTRUIR APPLICATION
+# ============================================================
+
+def criar_application():
+
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    # --------------------------------------------------------
+    # COMANDOS
+    # --------------------------------------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "status",
+            comando_status,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "fila",
+            comando_fila,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "erros",
+            comando_erros,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "retry",
+            comando_retry,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "adicionar",
+            comando_adicionar,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "ajuda",
+            comando_ajuda,
+        )
+    )
+
+    # --------------------------------------------------------
+    # LINKS ENVIADOS DIRETAMENTE
+    # --------------------------------------------------------
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND,
+            receber_links,
+        )
+    )
+
+    return application
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    logger.info(
+        "=========================================="
+    )
+
+    logger.info(
+        "🦊 RAPOSA CAÇADORA iniciando..."
+    )
+
+    # --------------------------------------------------------
+    # Validar configuração
+    # --------------------------------------------------------
+
+    validar_configuracao()
+
+    # --------------------------------------------------------
+    # Supabase
+    # --------------------------------------------------------
+
+    iniciar_supabase()
+
+    # --------------------------------------------------------
+    # Recuperar produtos que eventualmente ficaram presos
+    # antes de iniciar o bot.
+    # --------------------------------------------------------
+
+    try:
+
+        recuperar_processamentos_presos()
+
+    except Exception as erro:
+
+        logger.warning(
+            "Não foi possível recuperar "
+            "processamentos presos: %s",
+            erro,
+        )
+
+    # --------------------------------------------------------
+    # Servidor HTTP para Render
+    # --------------------------------------------------------
+
+    servidor_thread = threading.Thread(
+        target=iniciar_servidor_http,
+        daemon=True,
+    )
+
+    servidor_thread.start()
+
+    # --------------------------------------------------------
+    # Telegram
+    # --------------------------------------------------------
+
+    application = criar_application()
+
+    logger.info(
+        "=========================================="
+    )
+
+    logger.info(
+        "Bot Telegram iniciando..."
+    )
+
+    # --------------------------------------------------------
+    # Run polling
+    # --------------------------------------------------------
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+    )
+
+
+# ============================================================
+# EXECUÇÃO
+# ============================================================
+
+if __name__ == "__main__":
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "🦊 Raposa Caçadora encerrada."
+        )
+
+    except Exception as erro:
+
+        logger.exception(
+            "Erro fatal: %s",
+            erro,
+        )
+
+        raise
