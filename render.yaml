@@ -24,7 +24,7 @@ services:
         value: "1"
 
       - key: INTERVALO_MINUTOS
-        value: "10"
+        value: "20"
 
       - key: DESCONTO_MINIMO
         value: "30"
