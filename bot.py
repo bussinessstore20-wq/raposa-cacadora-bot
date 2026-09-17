@@ -14,7 +14,9 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
 from telegram.constants import ParseMode
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -59,12 +61,20 @@ SUPABASE_KEY = os.getenv(
     "",
 ).strip()
 
-INTERVALO_MINUTOS = int(
-    os.getenv(
-        "INTERVALO_MINUTOS",
-        "20",
-    )
-)
+# ============================================================
+# INTERVALO FIXO
+# ============================================================
+#
+# NÃO DEPENDE DO RENDER.
+#
+# Sempre serão 20 minutos entre publicações
+# bem-sucedidas.
+#
+# ============================================================
+
+INTERVALO_MINUTOS = 20
+
+MAX_LINKS_POR_ENVIO = 20
 
 PORT = int(
     os.getenv(
@@ -72,8 +82,6 @@ PORT = int(
         "10000",
     )
 )
-
-MAX_LINKS_POR_ENVIO = 20
 
 
 # ============================================================
@@ -107,11 +115,13 @@ def iniciar_supabase():
     global supabase
 
     if not SUPABASE_URL:
+
         raise RuntimeError(
             "SUPABASE_URL não configurada."
         )
 
     if not SUPABASE_KEY:
+
         raise RuntimeError(
             "SUPABASE_KEY não configurada."
         )
@@ -163,6 +173,7 @@ class HealthHandler(
         format,
         *args,
     ):
+
         return
 
 
@@ -226,11 +237,6 @@ def validar_configuracao():
             "SUPABASE_KEY não configurada."
         )
 
-    if INTERVALO_MINUTOS < 1:
-        erros.append(
-            "INTERVALO_MINUTOS deve ser maior que 0."
-        )
-
     if erros:
 
         for erro in erros:
@@ -254,8 +260,12 @@ def validar_configuracao():
         "Configuração validada."
     )
 
+    # ========================================================
+    # MOSTRAR INTERVALO REAL
+    # ========================================================
+
     logger.info(
-        "Intervalo: %d minutos",
+        "INTERVALO DE PUBLICAÇÃO: %d minutos",
         INTERVALO_MINUTOS,
     )
 
@@ -322,12 +332,14 @@ def extrair_links(
             "]",
             "}",
         ):
+
             link = link[:-1]
 
         if not (
             link.startswith("http://")
             or link.startswith("https://")
         ):
+
             continue
 
         link_lower = link.lower()
@@ -336,6 +348,7 @@ def extrair_links(
             "shopee.com.br" in link_lower
             or "s.shopee.com.br" in link_lower
         ):
+
             links.append(link)
 
     resultado = []
@@ -362,6 +375,7 @@ def inserir_links(
 ) -> tuple[int, int, list[str]]:
 
     if supabase is None:
+
         raise RuntimeError(
             "Supabase não inicializado."
         )
@@ -433,6 +447,7 @@ def inserir_links(
 def buscar_proximo_produto():
 
     if supabase is None:
+
         raise RuntimeError(
             "Supabase não inicializado."
         )
@@ -510,21 +525,11 @@ def marcar_publicado(
             produto.get("productName")
             or "Produto"
         ),
-        "shop_id": produto.get(
-            "shopId"
-        ),
-        "item_id": produto.get(
-            "itemId"
-        ),
-        "image_url": produto.get(
-            "imageUrl"
-        ),
-        "telegram_message_id": (
-            telegram_message_id
-        ),
-        "telegram_chat_id": (
-            TELEGRAM_CHAT_ID
-        ),
+        "shop_id": produto.get("shopId"),
+        "item_id": produto.get("itemId"),
+        "image_url": produto.get("imageUrl"),
+        "telegram_message_id": telegram_message_id,
+        "telegram_chat_id": TELEGRAM_CHAT_ID,
         "published_at": agora,
         "processing_at": None,
         "erro": None,
@@ -591,7 +596,7 @@ def marcar_erro(
 
 
 # ============================================================
-# SUPABASE - RECUPERAR PROCESSAMENTOS PRESOS
+# RECUPERAR PROCESSAMENTOS PRESOS
 # ============================================================
 
 def recuperar_processamentos_presos():
@@ -669,10 +674,7 @@ def numero(
             return padrao
 
         return float(
-            texto.replace(
-                ",",
-                ".",
-            )
+            texto.replace(",", ".")
         )
 
     except Exception:
@@ -748,46 +750,32 @@ def montar_mensagem(
 ):
 
     nome = (
-        produto.get(
-            "productName"
-        )
+        produto.get("productName")
         or "Produto"
     )
 
     preco = numero(
-        produto.get(
-            "price"
-        )
+        produto.get("price")
     )
 
     preco_min = numero(
-        produto.get(
-            "priceMin"
-        )
+        produto.get("priceMin")
     )
 
     desconto = numero(
-        produto.get(
-            "priceDiscountRate"
-        )
+        produto.get("priceDiscountRate")
     )
 
     avaliacao = numero(
-        produto.get(
-            "ratingStar"
-        )
+        produto.get("ratingStar")
     )
 
     vendas = inteiro(
-        produto.get(
-            "sales"
-        )
+        produto.get("sales")
     )
 
     loja = (
-        produto.get(
-            "shopName"
-        )
+        produto.get("shopName")
         or "Loja Shopee"
     )
 
@@ -805,8 +793,7 @@ def montar_mensagem(
         preco_anterior = (
             preco_atual
             / (
-                1
-                - desconto / 100
+                1 - desconto / 100
             )
         )
 
@@ -855,9 +842,7 @@ async def publicar_produto(
     )
 
     image_url = (
-        produto.get(
-            "imageUrl"
-        )
+        produto.get("imageUrl")
         or ""
     )
 
@@ -937,7 +922,7 @@ async def publicar_produto(
 
 
 # ============================================================
-# NOTIFICAÇÃO PARA ADMIN
+# NOTIFICAÇÃO ADMIN
 # ============================================================
 
 async def enviar_notificacao_admin(
@@ -1058,7 +1043,8 @@ async def processar_produto(
                 "\n"
                 f"📦 <b>{produto.get('productName', 'Produto')}</b>\n"
                 f"🆔 Fila: <b>#{produto_id}</b>\n"
-                f"📨 Mensagem: <b>#{message_id}</b>"
+                f"📨 Mensagem: <b>#{message_id}</b>\n"
+                f"⏱️ Próxima publicação: <b>{INTERVALO_MINUTOS} minutos</b>"
             ),
         )
 
@@ -1118,7 +1104,7 @@ async def processar_produto(
 
 
 # ============================================================
-# TECLADO PRINCIPAL
+# TECLADO
 # ============================================================
 
 def teclado_controle():
@@ -1149,6 +1135,9 @@ async def comando_start(
 ):
 
     if not usuario_autorizado(update):
+        return
+
+    if update.message is None:
         return
 
     mensagem = (
@@ -1185,6 +1174,9 @@ async def comando_status(
     if not usuario_autorizado(update):
         return
 
+    if update.message is None:
+        return
+
     if supabase is None:
         return
 
@@ -1209,29 +1201,25 @@ async def comando_status(
         publicados = sum(
             1
             for item in registros
-            if item.get("status")
-            == "published"
+            if item.get("status") == "published"
         )
 
         pendentes = sum(
             1
             for item in registros
-            if item.get("status")
-            == "pending"
+            if item.get("status") == "pending"
         )
 
         processando = sum(
             1
             for item in registros
-            if item.get("status")
-            == "processing"
+            if item.get("status") == "processing"
         )
 
         erros = sum(
             1
             for item in registros
-            if item.get("status")
-            == "error"
+            if item.get("status") == "error"
         )
 
         estado = (
@@ -1284,6 +1272,9 @@ async def comando_fila(
     if not usuario_autorizado(update):
         return
 
+    if update.message is None:
+        return
+
     if supabase is None:
         return
 
@@ -1333,18 +1324,13 @@ async def comando_fila(
             )
 
             nome = (
-                item.get(
-                    "product_name"
-                )
+                item.get("product_name")
                 or "Aguardando processamento"
             )
 
             if len(nome) > 45:
 
-                nome = (
-                    nome[:42]
-                    + "..."
-                )
+                nome = nome[:42] + "..."
 
             linhas.append(
                 f"{simbolo} #{item['id']} — {nome}"
@@ -1387,6 +1373,9 @@ async def comando_erros(
 ):
 
     if not usuario_autorizado(update):
+        return
+
+    if update.message is None:
         return
 
     if supabase is None:
@@ -1433,10 +1422,7 @@ async def comando_erros(
 
             if len(erro) > 300:
 
-                erro = (
-                    erro[:297]
-                    + "..."
-                )
+                erro = erro[:297] + "..."
 
             linhas.append(
                 f"❌ <b>#{item['id']}</b>"
@@ -1489,6 +1475,9 @@ async def comando_retry(
 ):
 
     if not usuario_autorizado(update):
+        return
+
+    if update.message is None:
         return
 
     if supabase is None:
@@ -1553,6 +1542,9 @@ async def comando_stop(
     if not usuario_autorizado(update):
         return
 
+    if update.message is None:
+        return
+
     bot_ativo = False
 
     logger.warning(
@@ -1589,35 +1581,7 @@ async def comando_iniciar(
     if not usuario_autorizado(update):
         return
 
-    bot_ativo = True
-
-    logger.info(
-        "Publicação iniciada pelo administrador."
-    )
-
-    await update.message.reply_text(
-        (
-            "▶️ <b>PUBLICAÇÃO INICIADA</b>\n"
-            "\n"
-            "A Raposa Caçadora voltou a processar "
-            "a fila do Supabase.\n"
-            "\n"
-            f"⏱️ Intervalo: <b>{INTERVALO_MINUTOS} minutos</b>"
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=teclado_controle(),
-# ============================================================
-# /INICIAR
-# ============================================================
-
-async def comando_iniciar(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    global bot_ativo
-
-    if not usuario_autorizado(update):
+    if update.message is None:
         return
 
     bot_ativo = True
@@ -1631,7 +1595,7 @@ async def comando_iniciar(
             "▶️ <b>PUBLICAÇÃO INICIADA</b>\n"
             "\n"
             "A Raposa Caçadora voltou a processar "
-            "a fila do Supabase.\n"
+            "a fila do Supabase.\n
             "\n"
             f"⏱️ Intervalo: <b>{INTERVALO_MINUTOS} minutos</b>"
         ),
@@ -1862,8 +1826,6 @@ async def worker_fila(
     bot: Bot,
 ):
 
-    global bot_ativo
-
     logger.info(
         "Worker da fila iniciado."
     )
@@ -1873,7 +1835,7 @@ async def worker_fila(
         try:
 
             # ------------------------------------------------
-            # STOP
+            # BOT PARADO
             # ------------------------------------------------
 
             if not bot_ativo:
@@ -1883,7 +1845,7 @@ async def worker_fila(
                 continue
 
             # ------------------------------------------------
-            # Recuperar produtos presos
+            # RECUPERAR PROCESSAMENTOS PRESOS
             # ------------------------------------------------
 
             await asyncio.to_thread(
@@ -1891,7 +1853,7 @@ async def worker_fila(
             )
 
             # ------------------------------------------------
-            # Buscar próximo produto
+            # BUSCAR PRÓXIMO PRODUTO
             # ------------------------------------------------
 
             produto = await asyncio.to_thread(
@@ -1910,7 +1872,7 @@ async def worker_fila(
                 continue
 
             # ------------------------------------------------
-            # Processar
+            # PROCESSAR
             # ------------------------------------------------
 
             sucesso = await processar_produto(
@@ -1919,7 +1881,7 @@ async def worker_fila(
             )
 
             # ------------------------------------------------
-            # STOP pode ter sido acionado
+            # SE BOT FOI PARADO
             # ------------------------------------------------
 
             if not bot_ativo:
@@ -1927,30 +1889,64 @@ async def worker_fila(
                 continue
 
             # ------------------------------------------------
-            # Se publicou, aguarda intervalo
+            # PUBLICOU COM SUCESSO
             # ------------------------------------------------
 
             if sucesso:
 
                 logger.info(
-                    "Aguardando %d minutos "
-                    "para o próximo produto...",
+                    "=========================================="
+                )
+
+                logger.info(
+                    "PRODUTO PUBLICADO COM SUCESSO."
+                )
+
+                logger.info(
+                    "Próxima publicação em %d minutos.",
                     INTERVALO_MINUTOS,
                 )
 
-                for _ in range(
-                    INTERVALO_MINUTOS * 60
+                # ------------------------------------------------
+                # CONTAGEM EXATA DE 20 MINUTOS
+                # ------------------------------------------------
+
+                segundos = INTERVALO_MINUTOS * 60
+
+                for restante in range(
+                    segundos,
+                    0,
+                    -1,
                 ):
 
                     if not bot_ativo:
+
+                        logger.info(
+                            "Contagem interrompida pelo STOP."
+                        )
+
                         break
 
                     await asyncio.sleep(1)
 
+                if bot_ativo:
+
+                    logger.info(
+                        "Intervalo finalizado. "
+                        "Buscando próximo produto."
+                    )
+
+            # ------------------------------------------------
+            # ERRO
+            # ------------------------------------------------
+
             else:
 
                 logger.warning(
-                    "Produto apresentou erro. "
+                    "Produto apresentou erro."
+                )
+
+                logger.info(
                     "Aguardando 30 segundos antes "
                     "de verificar a fila novamente."
                 )
@@ -1986,7 +1982,7 @@ async def worker_fila(
                         "\n"
                         f"{str(erro)[:1500]}\n"
                         "\n"
-                        "O worker tentará continuar automaticamente."
+                        "O worker continuará automaticamente."
                     ),
                 )
 
@@ -2053,6 +2049,19 @@ async def post_init(
         )
 
         raise
+
+    logger.info(
+        "=========================================="
+    )
+
+    logger.info(
+        "INTERVALO CONFIGURADO: %d MINUTOS",
+        INTERVALO_MINUTOS,
+    )
+
+    logger.info(
+        "=========================================="
+    )
 
     await iniciar_worker(
         application
@@ -2217,7 +2226,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # START POLLING
+    # POLLING
     # --------------------------------------------------------
 
     logger.info(
@@ -2244,6 +2253,7 @@ if __name__ == "__main__":
 
         logger.info(
             "🦊 Raposa Caçadora encerrada."
+
         )
 
     except Exception as erro:
