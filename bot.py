@@ -2219,15 +2219,30 @@ def main():
     # START POLLING
     # --------------------------------------------------------
 
-    logger.info(
-        "Bot Telegram iniciando polling..."
-    )
+    l# Durante um deploy do Render, a instância antiga pode permanecer
+# ativa por alguns segundos enquanto a nova sobe. Como o Telegram
+# permite apenas um getUpdates ativo por bot, aguardamos a janela
+# de encerramento da instância anterior antes de começar o polling.
+atraso_polling = int(
+    os.getenv("TELEGRAM_POLLING_START_DELAY", "75")
+)
 
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=False,
-    )
+logger.info(
+    "Aguardando %d segundos antes de iniciar o polling do Telegram...",
+    atraso_polling,
+)
 
+import time
+time.sleep(atraso_polling)
+
+logger.info(
+    "Bot Telegram iniciando polling..."
+)
+
+application.run_polling(
+    allowed_updates=Update.ALL_TYPES,
+    drop_pending_updates=False,
+)
 
 # ============================================================
 # EXECUÇÃO
