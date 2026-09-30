@@ -30,6 +30,11 @@ from shopee import (
     ShopeeAPIError,
 )
 
+from mercadolivre import (
+    buscar_produto_por_link as buscar_produto_mercadolivre,
+    MercadoLivreAPIError,
+)
+
 
 # ============================================================
 # CONFIGURAÇÃO
@@ -336,6 +341,9 @@ def extrair_links(
         if (
             "shopee.com.br" in link_lower
             or "s.shopee.com.br" in link_lower
+            or "mercadolivre.com.br" in link_lower
+            or "mercadolibre.com" in link_lower
+            or "meli.la" in link_lower
         ):
             links.append(link)
 
@@ -748,6 +756,7 @@ def formatar_vendas(
 
 def montar_mensagem(
     produto,
+    marketplace=None,
 ):
 
     nome = (
@@ -817,6 +826,51 @@ def montar_mensagem(
 
         preco_anterior = preco_atual
 
+    if marketplace == "mercadolivre":
+
+        partes = [
+            "🟨 <b>OFERTA MERCADO LIVRE</b>\n",
+            "\n",
+            f"✨ <b>{nome}</b>\n",
+            "\n",
+            "━━━━━━━━━━━━━━━━━━\n",
+            "\n",
+        ]
+
+        if preco_anterior > preco_atual > 0:
+            partes.append(
+                f"❌ De: <s>{moeda(preco_anterior)}</s>\n"
+            )
+
+        partes.append(
+            f"💰 <b>Por apenas: {moeda(preco_atual)}</b>\n"
+        )
+
+        if desconto > 0:
+            partes.append(
+                f"🏷️ <b>{desconto:.0f}% OFF</b>\n"
+            )
+
+        partes.extend([
+            "\n",
+            "━━━━━━━━━━━━━━━━━━\n",
+            "\n",
+        ])
+
+        if vendas > 0:
+            partes.append(
+                f"📦 <b>{formatar_vendas(vendas)}</b> vendas\n"
+            )
+
+        partes.extend([
+            "🏪 <b>Mercado Livre</b>\n",
+            "\n",
+            "🚨 <b>Preço sujeito a alteração.</b>\n",
+            "⚡ Aproveite enquanto estiver disponível!",
+        ])
+
+        return "".join(partes)
+
     mensagem = (
         "🔥 <b>OFERTA EM DESTAQUE</b>\n"
         "\n"
@@ -849,10 +903,12 @@ async def publicar_produto(
     bot: Bot,
     produto: dict[str, Any],
     link_afiliado: str,
+    marketplace=None,
 ):
 
     mensagem = montar_mensagem(
-        produto
+        produto,
+        marketplace=marketplace,
     )
 
     image_url = (
@@ -1007,16 +1063,51 @@ async def processar_produto(
 
     try:
 
-        produto = await asyncio.to_thread(
-            buscar_produto_por_link,
-            link,
-        )
+        link_lower = str(link).lower()
+
+        if any(
+            dominio in link_lower
+            for dominio in (
+                "mercadolivre.com.br",
+                "mercadolibre.com",
+                "meli.la",
+            )
+        ):
+            logger.info(
+                "Detectado link do Mercado Livre."
+            )
+
+            produto = await asyncio.to_thread(
+                buscar_produto_mercadolivre,
+                link,
+            )
+
+            marketplace = "mercadolivre"
+
+        else:
+            logger.info(
+                "Detectado link da Shopee."
+            )
+
+            produto = await asyncio.to_thread(
+                buscar_produto_por_link,
+                link,
+            )
+
+            marketplace = "shopee"
 
         if not produto:
+
+            if marketplace == "mercadolivre":
+                raise MercadoLivreAPIError(
+                    "Produto não encontrado."
+                )
 
             raise ShopeeAPIError(
                 "Produto não encontrado."
             )
+
+        produto["marketplace"] = marketplace
 
         logger.info(
             "Produto encontrado: %s",
@@ -1031,6 +1122,7 @@ async def processar_produto(
                 bot=bot,
                 produto=produto,
                 link_afiliado=link,
+                marketplace=marketplace,
             )
         )
 
@@ -1065,7 +1157,7 @@ async def processar_produto(
 
         return True
 
-    except ShopeeAPIError as erro:
+    except (ShopeeAPIError, MercadoLivreAPIError) as erro:
 
         logger.error(
             "Erro da Shopee: %s",
@@ -1728,7 +1820,7 @@ async def receber_links(
 
         await update.message.reply_text(
             (
-                "⚠️ Não encontrei links da Shopee.\n\n"
+                "⚠️ Não encontrei links da Shopee ou Mercado Livre.\n\n"
                 "Envie um ou vários links, por exemplo:\n"
                 "https://s.shopee.com.br/..."
             )
