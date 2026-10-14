@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+import requests
 import threading
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -49,6 +50,12 @@ TELEGRAM_CHAT_ID = os.getenv(
     "TELEGRAM_CHAT_ID",
     "",
 ).strip()
+
+# Encaminhamento opcional de ofertas para o canal WhatsApp via WAHA.
+WAHA_URL = os.getenv("WAHA_URL", "https://raposa-waha.onrender.com").strip().rstrip("/")
+WAHA_API_KEY = os.getenv("WAHA_API_KEY", "").strip()
+WAHA_CHANNEL_ID = os.getenv("WAHA_CHANNEL_ID", "").strip()
+WHATSAPP_FORWARD_ENABLED = os.getenv("WHATSAPP_FORWARD_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 TELEGRAM_ADMIN_ID = os.getenv(
     "TELEGRAM_ADMIN_ID",
@@ -841,6 +848,59 @@ def montar_mensagem(
     )
 
 # ============================================================
+# ENCAMINHAMENTO OPCIONAL PARA O CANAL WHATSAPP (WAHA)
+# ============================================================
+
+async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, link_afiliado: str):
+    """Encaminha a oferta ao canal WhatsApp sem interferir na publicação do Telegram."""
+    if not WHATSAPP_FORWARD_ENABLED:
+        return
+    if not WAHA_API_KEY or not WAHA_CHANNEL_ID:
+        logger.warning("Encaminhamento WhatsApp habilitado, mas WAHA_API_KEY/WAHA_CHANNEL_ID não estão configurados.")
+        return
+
+    import re
+    from html import unescape
+
+    texto = unescape(re.sub(r"<[^>]+>", "", mensagem_html or "")).strip()
+    if link_afiliado:
+        texto = f"{texto}\n\n🛒 COMPRAR AGORA: {link_afiliado}"
+
+    image_url = str(produto.get("imageUrl") or "").strip()
+
+    def _enviar():
+        headers = {"X-Api-Key": WAHA_API_KEY, "Content-Type": "application/json", "Accept": "application/json"}
+        endpoint = f"{WAHA_URL}/api/sendImage" if image_url else f"{WAHA_URL}/api/sendText"
+        payload = {"session": "default", "chatId": WAHA_CHANNEL_ID}
+        if image_url:
+            payload.update({
+                "file": {"url": image_url, "mimetype": "image/jpeg", "filename": "oferta.jpg"},
+                "caption": texto,
+            })
+        else:
+            payload["text"] = texto
+
+        resposta = requests.post(endpoint, headers=headers, json=payload, timeout=25)
+        if not resposta.ok and image_url:
+            logger.warning("WAHA recusou imagem (%s); tentando encaminhar apenas texto.", resposta.status_code)
+            resposta = requests.post(
+                f"{WAHA_URL}/api/sendText",
+                headers=headers,
+                json={"session": "default", "chatId": WAHA_CHANNEL_ID, "text": texto},
+                timeout=25,
+            )
+        resposta.raise_for_status()
+        return resposta.status_code
+
+    try:
+        status_code = await asyncio.to_thread(_enviar)
+        logger.info("Oferta encaminhada ao canal WhatsApp via WAHA (HTTP %s).", status_code)
+    except Exception:
+        # A falha do WhatsApp não deve reverter nem marcar como falha a postagem já feita no Telegram.
+        logger.exception("Falha ao encaminhar oferta ao WhatsApp; publicação do Telegram permanece válida.")
+
+
+# ============================================================
 # PUBLICAR PRODUTO
 # ============================================================
 
@@ -892,6 +952,8 @@ async def publicar_produto(
                 "Produto publicado com imagem e botão."
             )
 
+            await encaminhar_para_whatsapp(produto, mensagem, link_afiliado)
+
             return (
                 True,
                 mensagem_enviada.message_id,
@@ -919,6 +981,8 @@ async def publicar_produto(
         logger.info(
             "Produto publicado somente como texto."
         )
+
+        await encaminhar_para_whatsapp(produto, mensagem, link_afiliado)
 
         return (
             True,
