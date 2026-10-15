@@ -937,19 +937,32 @@ async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
         try:
             link = str(item.get("link") or "")
             lower = link.lower()
-            if any(d in lower for d in ("mercadolivre.com.br", "mercadolibre.com", "meli.la")):
-                produto = await asyncio.to_thread(buscar_produto_mercadolivre, link)
-                marketplace = "mercadolivre"
+            marketplace = "mercadolivre" if any(d in lower for d in ("mercadolivre.com.br", "mercadolibre.com", "meli.la")) else "shopee"
+            try:
+                if marketplace == "mercadolivre":
+                    produto = await asyncio.to_thread(buscar_produto_mercadolivre, link)
+                else:
+                    produto = await asyncio.to_thread(buscar_produto_por_link, link)
+            except Exception:
+                logger.exception("Não foi possível consultar novamente o produto histórico #%s; usando os dados salvos na fila.", pid)
+                produto = None
+
+            if produto:
+                produto["marketplace"] = marketplace
+                mensagem = montar_mensagem(produto, marketplace=marketplace)
             else:
-                produto = await asyncio.to_thread(buscar_produto_por_link, link)
-                marketplace = "shopee"
-            if not produto:
-                raise RuntimeError("O marketplace não retornou os dados do produto.")
-            produto["marketplace"] = marketplace
-            mensagem = montar_mensagem(produto, marketplace=marketplace)
+                # Fallback para ofertas antigas: não falhar só porque o marketplace não
+                # resolve mais o link ou a API não consegue recuperar o anúncio.
+                nome_salvo = str(item.get("product_name") or "Oferta")
+                imagem_salva = str(item.get("image_url") or "").strip()
+                produto = {"productName": nome_salvo, "imageUrl": imagem_salva, "marketplace": marketplace}
+                titulo = "MERCADO LIVRE" if marketplace == "mercadolivre" else "SHOPEE"
+                mensagem = f"🦊🔥 ACHADINHO {titulo}\n\n✨ {nome_salvo}\n\n🚨 Oferta publicada anteriormente; preço e disponibilidade podem ter mudado."
+                logger.warning("Usando nome e imagem salvos para o produto histórico #%s.", pid)
+
             resultado = await encaminhar_para_whatsapp(produto, mensagem, link, historico=True)
             if not resultado:
-                raise RuntimeError("O envio ao WhatsApp não foi confirmado.")
+                raise RuntimeError("O envio ao WhatsApp não foi confirmado; confira a sessão e a chave WAHA nos logs do serviço.")
             await asyncio.to_thread(
                 lambda pid=pid, mid=resultado.get("message_id", ""): supabase.table("whatsapp_backfill_log").upsert(
                     {"produto_fila_id": pid, "channel_id": WAHA_CHANNEL_ID, "status": "sent", "whatsapp_message_id": mid, "error": None, "sent_at": datetime.now(timezone.utc).isoformat()},
