@@ -1452,6 +1452,126 @@ async def comando_start(
 # /WHATSAPP_LOTE - PROCESSAR 5 OFERTAS HISTÓRICAS
 # ============================================================
 
+async def comando_whatsapp_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Envia um único produto já publicado ao WhatsApp, sem republicar no Telegram."""
+    if not usuario_autorizado(update):
+        return
+    if update.message is None:
+        return
+    if supabase is None:
+        await update.message.reply_text("❌ Supabase não está conectado. Nenhum envio foi feito.")
+        return
+    if not WAHA_API_KEY or not WAHA_CHANNEL_ID:
+        await update.message.reply_text("⚠️ WAHA_API_KEY ou WAHA_CHANNEL_ID não configurada. Nenhum envio foi feito.")
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Use: /whatsapp_id 426\nEnvie apenas um ID por vez.")
+        return
+
+    produto_id = int(context.args[0])
+    try:
+        resposta = await asyncio.to_thread(
+            lambda: supabase.table("produtos_fila")
+                .select("id,link,product_name,image_url,status,fila_origem,bot_id,telegram_message_id")
+                .eq("id", produto_id)
+                .eq("fila_origem", FILA_ORIGEM)
+                .eq("bot_id", FILA_ORIGEM)
+                .eq("status", "published")
+                .not_.is_("telegram_message_id", "null")
+                .limit(1)
+                .execute()
+        )
+        if not resposta.data:
+            await update.message.reply_text(
+                f"⚠️ O registro #{produto_id} não foi encontrado como publicado pelo Raposa Caçadora Bot. Nada foi enviado."
+            )
+            return
+        item = resposta.data[0]
+
+        registro_log = await asyncio.to_thread(
+            lambda: supabase.table("whatsapp_backfill_log")
+                .select("status,whatsapp_message_id")
+                .eq("produto_fila_id", produto_id)
+                .eq("channel_id", WAHA_CHANNEL_ID)
+                .limit(1)
+                .execute()
+        )
+        logs = registro_log.data or []
+        if logs and logs[0].get("status") in ("sent", "sending"):
+            await update.message.reply_text(
+                f"🛡️ O produto #{produto_id} já está marcado como {logs[0].get('status')} para este WhatsApp. Não vou reenviar para evitar duplicidade."
+            )
+            return
+
+        # Reserva o ID antes da chamada ao WAHA para bloquear comandos repetidos.
+        await asyncio.to_thread(
+            lambda: supabase.table("whatsapp_backfill_log").upsert(
+                {
+                    "produto_fila_id": produto_id,
+                    "channel_id": WAHA_CHANNEL_ID,
+                    "status": "sending",
+                    "error": None,
+                },
+                on_conflict="produto_fila_id"
+            ).execute()
+        )
+
+        link = str(item.get("link") or "").strip()
+        nome = str(item.get("product_name") or "Oferta").strip()
+        lower = link.lower()
+        marketplace = "mercadolivre" if any(d in lower for d in ("mercadolivre.com.br", "mercadolibre.com", "meli.la")) else "shopee"
+        titulo = "MERCADO LIVRE" if marketplace == "mercadolivre" else "SHOPEE"
+        produto = {
+            "productName": nome,
+            "imageUrl": str(item.get("image_url") or "").strip(),
+            "marketplace": marketplace,
+        }
+        mensagem = (
+            f"🦊🔥 ACHADINHO {titulo}\n\n"
+            f"✨ {nome}\n\n"
+            "🚨 Oferta publicada anteriormente; preço e disponibilidade podem ter mudado."
+        )
+        resultado = await encaminhar_para_whatsapp(produto, mensagem, link, historico=True)
+        if not resultado:
+            raise RuntimeError("WAHA não confirmou o envio. Confira a sessão e os logs antes de tentar novamente.")
+
+        await asyncio.to_thread(
+            lambda: supabase.table("whatsapp_backfill_log").upsert(
+                {
+                    "produto_fila_id": produto_id,
+                    "channel_id": WAHA_CHANNEL_ID,
+                    "status": "sent",
+                    "whatsapp_message_id": resultado.get("message_id", ""),
+                    "error": None,
+                    "sent_at": datetime.now(timezone.utc).isoformat(),
+                },
+                on_conflict="produto_fila_id"
+            ).execute()
+        )
+        await update.message.reply_text(
+            f"✅ Produto #{produto_id} enviado ao WhatsApp.\n\n{nome}\n{link}\n\nID WAHA: {resultado.get('message_id') or 'não informado'}"
+        )
+    except Exception as erro:
+        logger.exception("Erro no comando /whatsapp_id para produto #%s", produto_id)
+        try:
+            await asyncio.to_thread(
+                lambda: supabase.table("whatsapp_backfill_log").upsert(
+                    {
+                        "produto_fila_id": produto_id,
+                        "channel_id": WAHA_CHANNEL_ID,
+                        "status": "error",
+                        "error": str(erro)[:1000],
+                    },
+                    on_conflict="produto_fila_id"
+                ).execute()
+            )
+        except Exception:
+            logger.exception("Não foi possível registrar falha de envio do produto #%s", produto_id)
+        await update.message.reply_text(
+            f"❌ Não consegui confirmar o envio do produto #{produto_id}. Confira os logs do serviço antes de tentar novamente.\n\nErro: {str(erro)[:500]}"
+        )
+
+
 async def comando_whatsapp_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global whatsapp_backfill_task, whatsapp_backfill_stop_requested
 
@@ -2458,6 +2578,13 @@ def main():
         CommandHandler(
             "whatsapp_lote",
             comando_whatsapp_lote,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "whatsapp_id",
+            comando_whatsapp_id,
         )
     )
 
