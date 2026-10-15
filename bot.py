@@ -886,6 +886,11 @@ async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, 
 
         resposta = requests.post(endpoint, headers=headers, json=payload, timeout=25)
         if not resposta.ok and image_url:
+            # Em 5xx, o WAHA provavelmente está indisponível ou sem recursos.
+            # Não fazer uma segunda chamada imediatamente evita agravar a falha.
+            if resposta.status_code >= 500:
+                logger.error("WAHA indisponível ao enviar imagem (HTTP %s); não tentarei texto enquanto o serviço estiver com erro 5xx.", resposta.status_code)
+                resposta.raise_for_status()
             logger.warning("WAHA recusou imagem (%s); tentando encaminhar apenas texto.", resposta.status_code)
             resposta = requests.post(
                 f"{WAHA_URL}/api/sendText",
@@ -1012,6 +1017,12 @@ async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
                     on_conflict="produto_fila_id"
                 ).execute()
             )
+            # Falhou um envio: interrompe o lote para não disparar várias requisições
+            # contra o WAHA quando ele está devolvendo 502/503. O próximo lote pode
+            # ser iniciado manualmente depois que o serviço estiver saudável.
+            interrompido = True
+            logger.error("Lote histórico encerrado após a primeira falha para proteger o WAHA; corrija/aguarde o serviço antes de tentar novamente.")
+            break
         finally:
             # Libera referências do processo Python do bot. A RAM do WAHA é separada;
             # a pausa entre envios também reduz a pressão sobre o serviço de mídia.
