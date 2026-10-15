@@ -960,6 +960,9 @@ async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
                 mensagem = f"🦊🔥 ACHADINHO {titulo}\n\n✨ {nome_salvo}\n\n🚨 Oferta publicada anteriormente; preço e disponibilidade podem ter mudado."
                 logger.warning("Usando nome e imagem salvos para o produto histórico #%s.", pid)
 
+            # No plano gratuito, evitar envio de mídia reduz o pico de memória no WAHA.
+            # O lote histórico usa texto + link; o fluxo normal de novos produtos não muda.
+            produto["imageUrl"] = ""
             resultado = await encaminhar_para_whatsapp(produto, mensagem, link, historico=True)
             if not resultado:
                 raise RuntimeError("O envio ao WhatsApp não foi confirmado; confira a sessão e a chave WAHA nos logs do serviço.")
@@ -970,6 +973,8 @@ async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
                 ).execute()
             )
             ok += 1
+            # Pequena pausa entre mensagens para não sobrecarregar a instância gratuita.
+            await asyncio.sleep(8)
         except Exception as erro:
             falhas += 1
             logger.exception("Falha no lote histórico para produto fila #%s", pid)
