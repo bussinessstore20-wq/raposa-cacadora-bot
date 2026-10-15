@@ -882,7 +882,7 @@ async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, 
             "session": "default",
             "chatId": WAHA_CHANNEL_ID,
             "text": texto,
-            "linkPreview": False,
+            "linkPreview": True,
         }
         resposta = requests.post(
             f"{WAHA_URL}/api/sendText",
