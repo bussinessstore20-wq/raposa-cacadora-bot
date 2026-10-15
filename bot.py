@@ -1937,7 +1937,6 @@ async def callback_controle(
     elif query.data == "bot_iniciar":
 
         bot_ativo = True
-        whatsapp_backfill_stop_requested = False
 
         logger.info(
             "Publicação iniciada pelo botão."
