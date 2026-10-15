@@ -1030,7 +1030,15 @@ async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
             produto = None
             gc.collect()
 
-    status_lote = "⏹️ <b>LOTE INTERROMPIDO PELO STOP</b>" if interrompido else "📦 <b>LOTE HISTÓRICO WHATSAPP CONCLUÍDO</b>"
+    if falhas:
+        status_lote = "⚠️ <b>LOTE PAUSADO APÓS FALHA NO WHATSAPP</b>"
+        orientacao_lote = "Não reinicie ainda: verifique/aguarde o WAHA voltar a responder sem erro 502/503."
+    elif interrompido:
+        status_lote = "⏹️ <b>LOTE INTERROMPIDO PELO STOP</b>"
+        orientacao_lote = "Use /whatsapp_lote quando quiser continuar."
+    else:
+        status_lote = "📦 <b>LOTE HISTÓRICO WHATSAPP CONCLUÍDO</b>"
+        orientacao_lote = "Use /whatsapp_lote para processar o próximo lote quando quiser continuar."
     await enviar_notificacao_admin(
         bot,
         f"{status_lote}\n\n"
@@ -1038,7 +1046,7 @@ async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
         f"⚠️ Falhas: <b>{falhas}</b>\n"
         "🖼️ O lote mantém as imagens sempre que houver URL disponível.\n"
         "📨 Somente WhatsApp foi utilizado; nenhuma nova postagem foi feita no Telegram.\n"
-        "Use /whatsapp_lote para processar o próximo lote quando quiser continuar."
+        f"{orientacao_lote}"
     )
 
 
