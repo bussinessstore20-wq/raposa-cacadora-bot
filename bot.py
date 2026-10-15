@@ -1359,11 +1359,17 @@ async def comando_start(
 async def comando_whatsapp_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not usuario_autorizado(update):
         return
+    if not WAHA_API_KEY or not WAHA_CHANNEL_ID:
+        await update.message.reply_text(
+            "⚠️ Ainda falta configurar WAHA_API_KEY no Render do raposa-cacadora-bot. Não enviei nada.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     await update.message.reply_text(
-        "📦 Vou encaminhar até 5 ofertas antigas ao WhatsApp. O Telegram não será usado nesse lote.",
+        "📦 Lote histórico iniciado em segundo plano: até 5 ofertas antigas serão enviadas ao WhatsApp. O bot continuará recebendo novos links e não publicará essas ofertas novamente no Telegram.",
         parse_mode=ParseMode.HTML,
     )
-    await processar_lote_historico_whatsapp(context.bot, limite=5)
+    asyncio.create_task(processar_lote_historico_whatsapp(context.bot, limite=5))
 
 
 # ============================================================
