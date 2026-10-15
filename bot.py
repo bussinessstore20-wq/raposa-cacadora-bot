@@ -147,6 +147,10 @@ bot_ativo = True
 
 worker_task: asyncio.Task | None = None
 
+# Controle independente do lote histórico do WhatsApp.
+whatsapp_backfill_task: asyncio.Task | None = None
+whatsapp_backfill_stop_requested = False
+
 
 # ============================================================
 # SERVIDOR HTTP PARA O RENDER
@@ -906,7 +910,11 @@ async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, 
 
 
 async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
-    """Envia somente ofertas já publicadas no Telegram; nunca chama publicação do Telegram."""
+    """Envia ofertas já publicadas no Telegram ao WhatsApp, com imagem e pausa controlável."""
+    global whatsapp_backfill_stop_requested
+
+    import gc
+
     if supabase is None:
         await enviar_notificacao_admin(bot, "❌ Supabase não está conectado.")
         return
@@ -932,8 +940,15 @@ async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
 
     ok = 0
     falhas = 0
+    interrompido = False
     for item in candidatos:
+        if whatsapp_backfill_stop_requested:
+            interrompido = True
+            logger.warning("Lote histórico interrompido pelo STOP antes do próximo produto.")
+            break
+
         pid = int(item["id"])
+        produto = None
         try:
             link = str(item.get("link") or "")
             lower = link.lower()
@@ -947,12 +962,18 @@ async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
                 logger.exception("Não foi possível consultar novamente o produto histórico #%s; usando os dados salvos na fila.", pid)
                 produto = None
 
+            if whatsapp_backfill_stop_requested:
+                interrompido = True
+                logger.warning("Lote histórico interrompido antes do envio do produto #%s.", pid)
+                break
+
             if produto:
                 produto["marketplace"] = marketplace
                 mensagem = montar_mensagem(produto, marketplace=marketplace)
+                # Se a consulta não retornou imagem, aproveita a imagem salva na publicação do Telegram.
+                if not produto.get("imageUrl"):
+                    produto["imageUrl"] = str(item.get("image_url") or "").strip()
             else:
-                # Fallback para ofertas antigas: não falhar só porque o marketplace não
-                # resolve mais o link ou a API não consegue recuperar o anúncio.
                 nome_salvo = str(item.get("product_name") or "Oferta")
                 imagem_salva = str(item.get("image_url") or "").strip()
                 produto = {"productName": nome_salvo, "imageUrl": imagem_salva, "marketplace": marketplace}
@@ -960,9 +981,7 @@ async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
                 mensagem = f"🦊🔥 ACHADINHO {titulo}\n\n✨ {nome_salvo}\n\n🚨 Oferta publicada anteriormente; preço e disponibilidade podem ter mudado."
                 logger.warning("Usando nome e imagem salvos para o produto histórico #%s.", pid)
 
-            # No plano gratuito, evitar envio de mídia reduz o pico de memória no WAHA.
-            # O lote histórico usa texto + link; o fluxo normal de novos produtos não muda.
-            produto["imageUrl"] = ""
+            # Preserva a imagem como no Telegram; WAHA recebe mídia + legenda.
             resultado = await encaminhar_para_whatsapp(produto, mensagem, link, historico=True)
             if not resultado:
                 raise RuntimeError("O envio ao WhatsApp não foi confirmado; confira a sessão e a chave WAHA nos logs do serviço.")
@@ -973,8 +992,17 @@ async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
                 ).execute()
             )
             ok += 1
-            # Pequena pausa entre mensagens para não sobrecarregar a instância gratuita.
-            await asyncio.sleep(8)
+
+            # Dá tempo para o WAHA concluir o envio da mídia e estabilizar antes do próximo.
+            # A pausa pode ser interrompida pelo botão STOP.
+            for _ in range(30):
+                if whatsapp_backfill_stop_requested:
+                    interrompido = True
+                    break
+                await asyncio.sleep(1)
+            if interrompido:
+                logger.warning("Lote histórico pausado depois do envio confirmado do produto #%s.", pid)
+                break
         except Exception as erro:
             falhas += 1
             logger.exception("Falha no lote histórico para produto fila #%s", pid)
@@ -984,14 +1012,22 @@ async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
                     on_conflict="produto_fila_id"
                 ).execute()
             )
+        finally:
+            # Libera referências do processo Python do bot. A RAM do WAHA é separada;
+            # a pausa entre envios também reduz a pressão sobre o serviço de mídia.
+            item = None
+            produto = None
+            gc.collect()
 
+    status_lote = "⏹️ <b>LOTE INTERROMPIDO PELO STOP</b>" if interrompido else "📦 <b>LOTE HISTÓRICO WHATSAPP CONCLUÍDO</b>"
     await enviar_notificacao_admin(
         bot,
-        "📦 <b>LOTE HISTÓRICO WHATSAPP CONCLUÍDO</b>\n\n"
+        f"{status_lote}\n\n"
         f"✅ Enviados: <b>{ok}</b>\n"
         f"⚠️ Falhas: <b>{falhas}</b>\n"
+        "🖼️ O lote mantém as imagens sempre que houver URL disponível.\n"
         "📨 Somente WhatsApp foi utilizado; nenhuma nova postagem foi feita no Telegram.\n"
-        "Use /whatsapp_lote para processar o próximo lote de 5."
+        "Use /whatsapp_lote para processar o próximo lote quando quiser continuar."
     )
 
 
@@ -1213,6 +1249,18 @@ async def processar_produto(
 
         produto["marketplace"] = marketplace
 
+        # Se o STOP foi acionado enquanto consultávamos o marketplace,
+        # devolve o item à fila em vez de publicar depois da pausa.
+        if not bot_ativo:
+            if supabase is not None:
+                await asyncio.to_thread(
+                    lambda: supabase.table("produtos_fila").update(
+                        {"status": "pending", "processing_at": None}
+                    ).eq("id", produto_id).eq("status", "processing").execute()
+                )
+            logger.info("STOP detectado antes da publicação; produto %s voltou para a fila.", produto_id)
+            return False
+
         logger.info(
             "Produto encontrado: %s",
             produto.get(
@@ -1375,6 +1423,8 @@ async def comando_start(
 # ============================================================
 
 async def comando_whatsapp_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global whatsapp_backfill_task, whatsapp_backfill_stop_requested
+
     if not usuario_autorizado(update):
         return
     if not WAHA_API_KEY or not WAHA_CHANNEL_ID:
@@ -1383,11 +1433,23 @@ async def comando_whatsapp_lote(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.HTML,
         )
         return
+    if whatsapp_backfill_task is not None and not whatsapp_backfill_task.done():
+        await update.message.reply_text(
+            "⏳ Já existe um lote histórico em execução. Use o botão STOP para interrompê-lo antes de iniciar outro.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=teclado_controle(),
+        )
+        return
+
+    whatsapp_backfill_stop_requested = False
     await update.message.reply_text(
-        "📦 Lote histórico iniciado em segundo plano: até 5 ofertas antigas serão enviadas ao WhatsApp. O bot continuará recebendo novos links e não publicará essas ofertas novamente no Telegram.",
+        "📦 Lote histórico iniciado: até 5 ofertas antigas serão enviadas ao WhatsApp COM IMAGEM quando disponível, com pausa de 30 segundos entre envios. O botão STOP interrompe o lote antes da próxima oferta; novos links continuam sendo recebidos.",
         parse_mode=ParseMode.HTML,
+        reply_markup=teclado_controle(),
     )
-    asyncio.create_task(processar_lote_historico_whatsapp(context.bot, limite=5))
+    whatsapp_backfill_task = asyncio.create_task(
+        processar_lote_historico_whatsapp(context.bot, limite=5)
+    )
 
 
 # ============================================================
@@ -1765,15 +1827,16 @@ async def comando_stop(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    global bot_ativo
+    global bot_ativo, whatsapp_backfill_stop_requested
 
     if not usuario_autorizado(update):
         return
 
     bot_ativo = False
+    whatsapp_backfill_stop_requested = True
 
     logger.warning(
-        "Publicação pausada pelo administrador."
+        "STOP acionado: publicação normal pausada e lote histórico do WhatsApp será interrompido."
     )
 
     await update.message.reply_text(
@@ -1835,7 +1898,7 @@ async def callback_controle(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    global bot_ativo
+    global bot_ativo, whatsapp_backfill_stop_requested
 
     query = update.callback_query
 
@@ -1856,23 +1919,25 @@ async def callback_controle(
     if query.data == "bot_stop":
 
         bot_ativo = False
+        whatsapp_backfill_stop_requested = True
 
         logger.warning(
-            "Publicação parada pelo botão STOP."
+            "Botão STOP acionado: fila normal pausada e lote histórico WhatsApp sinalizado para parar."
         )
 
         texto = (
-            "⏹️ <b>PUBLICAÇÃO PARADA</b>\n"
+            "⏹️ <b>PUBLICAÇÃO PAUSADA</b>\n"
             "\n"
             "A fila permanece salva no Supabase.\n"
-            "Nenhum novo produto será publicado.\n"
+            "O lote WhatsApp também foi sinalizado para parar; um envio já iniciado pode terminar.\n"
             "\n"
-            "▶️ Pressione INICIAR para continuar."
+            "▶️ Pressione INICIAR para retomar a fila. Para iniciar um novo lote histórico, use /whatsapp_lote."
         )
 
     elif query.data == "bot_iniciar":
 
         bot_ativo = True
+        whatsapp_backfill_stop_requested = False
 
         logger.info(
             "Publicação iniciada pelo botão."
