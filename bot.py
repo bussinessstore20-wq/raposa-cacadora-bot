@@ -851,13 +851,13 @@ def montar_mensagem(
 # ENCAMINHAMENTO OPCIONAL PARA O CANAL WHATSAPP (WAHA)
 # ============================================================
 
-async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, link_afiliado: str):
-    """Encaminha a oferta ao canal WhatsApp sem interferir na publicação do Telegram."""
-    if not WHATSAPP_FORWARD_ENABLED:
-        return
+async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, link_afiliado: str, *, historico: bool = False) -> bool:
+    """Encaminha a oferta ao canal WhatsApp sem publicar novamente no Telegram."""
+    if not historico and not WHATSAPP_FORWARD_ENABLED:
+        return False
     if not WAHA_API_KEY or not WAHA_CHANNEL_ID:
-        logger.warning("Encaminhamento WhatsApp habilitado, mas WAHA_API_KEY/WAHA_CHANNEL_ID não estão configurados.")
-        return
+        logger.warning("WhatsApp não enviado: configure WAHA_API_KEY e WAHA_CHANNEL_ID.")
+        return False
 
     import re
     from html import unescape
@@ -890,14 +890,91 @@ async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, 
                 timeout=25,
             )
         resposta.raise_for_status()
-        return resposta.status_code
+        try:
+            dados = resposta.json()
+        except Exception:
+            dados = {}
+        return resposta.status_code, str(dados.get("id") or dados.get("messageId") or "")
 
     try:
-        status_code = await asyncio.to_thread(_enviar)
+        status_code, message_id = await asyncio.to_thread(_enviar)
         logger.info("Oferta encaminhada ao canal WhatsApp via WAHA (HTTP %s).", status_code)
+        return {"status_code": status_code, "message_id": message_id}
     except Exception:
-        # A falha do WhatsApp não deve reverter nem marcar como falha a postagem já feita no Telegram.
-        logger.exception("Falha ao encaminhar oferta ao WhatsApp; publicação do Telegram permanece válida.")
+        logger.exception("Falha ao encaminhar oferta ao WhatsApp.")
+        return False
+
+
+async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
+    """Envia somente ofertas já publicadas no Telegram; nunca chama publicação do Telegram."""
+    if supabase is None:
+        await enviar_notificacao_admin(bot, "❌ Supabase não está conectado.")
+        return
+    if not WAHA_API_KEY or not WAHA_CHANNEL_ID:
+        await enviar_notificacao_admin(
+            bot,
+            "⚠️ Lote histórico não iniciado: falta configurar WAHA_API_KEY no Render do raposa-cacadora-bot. Nenhuma oferta foi enviada."
+        )
+        return
+
+    existentes = await asyncio.to_thread(
+        lambda: supabase.table("whatsapp_backfill_log").select("produto_fila_id").eq("channel_id", WAHA_CHANNEL_ID).eq("status", "sent").execute()
+    )
+    enviados = {int(x["produto_fila_id"]) for x in (existentes.data or [])}
+
+    resposta = await asyncio.to_thread(
+        lambda: supabase.table("produtos_fila").select("id,link,product_name,image_url,published_at").eq("fila_origem", FILA_ORIGEM).eq("bot_id", FILA_ORIGEM).eq("status", "published").not_.is_("telegram_message_id", "null").order("published_at", desc=True).limit(250).execute()
+    )
+    candidatos = [x for x in (resposta.data or []) if int(x["id"]) not in enviados][:limite]
+    if not candidatos:
+        await enviar_notificacao_admin(bot, "ℹ️ Não há ofertas históricas pendentes de envio ao WhatsApp.")
+        return
+
+    ok = 0
+    falhas = 0
+    for item in candidatos:
+        pid = int(item["id"])
+        try:
+            link = str(item.get("link") or "")
+            lower = link.lower()
+            if any(d in lower for d in ("mercadolivre.com.br", "mercadolibre.com", "meli.la")):
+                produto = await asyncio.to_thread(buscar_produto_mercadolivre, link)
+                marketplace = "mercadolivre"
+            else:
+                produto = await asyncio.to_thread(buscar_produto_por_link, link)
+                marketplace = "shopee"
+            if not produto:
+                raise RuntimeError("O marketplace não retornou os dados do produto.")
+            produto["marketplace"] = marketplace
+            mensagem = montar_mensagem(produto, marketplace=marketplace)
+            resultado = await encaminhar_para_whatsapp(produto, mensagem, link, historico=True)
+            if not resultado:
+                raise RuntimeError("O envio ao WhatsApp não foi confirmado.")
+            await asyncio.to_thread(
+                lambda pid=pid, mid=resultado.get("message_id", ""): supabase.table("whatsapp_backfill_log").upsert(
+                    {"produto_fila_id": pid, "channel_id": WAHA_CHANNEL_ID, "status": "sent", "whatsapp_message_id": mid, "error": None, "sent_at": datetime.now(timezone.utc).isoformat()},
+                    on_conflict="produto_fila_id"
+                ).execute()
+            )
+            ok += 1
+        except Exception as erro:
+            falhas += 1
+            logger.exception("Falha no lote histórico para produto fila #%s", pid)
+            await asyncio.to_thread(
+                lambda pid=pid, msg=str(erro)[:1000]: supabase.table("whatsapp_backfill_log").upsert(
+                    {"produto_fila_id": pid, "channel_id": WAHA_CHANNEL_ID, "status": "error", "error": msg},
+                    on_conflict="produto_fila_id"
+                ).execute()
+            )
+
+    await enviar_notificacao_admin(
+        bot,
+        "📦 <b>LOTE HISTÓRICO WHATSAPP CONCLUÍDO</b>\n\n"
+        f"✅ Enviados: <b>{ok}</b>\n"
+        f"⚠️ Falhas: <b>{falhas}</b>\n"
+        "📨 Somente WhatsApp foi utilizado; nenhuma nova postagem foi feita no Telegram.\n"
+        "Use /whatsapp_lote para processar o próximo lote de 5."
+    )
 
 
 # ============================================================
@@ -1273,6 +1350,20 @@ async def comando_start(
         parse_mode=ParseMode.HTML,
         reply_markup=teclado_controle(),
     )
+
+
+# ============================================================
+# /WHATSAPP_LOTE - PROCESSAR 5 OFERTAS HISTÓRICAS
+# ============================================================
+
+async def comando_whatsapp_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not usuario_autorizado(update):
+        return
+    await update.message.reply_text(
+        "📦 Vou encaminhar até 5 ofertas antigas ao WhatsApp. O Telegram não será usado nesse lote.",
+        parse_mode=ParseMode.HTML,
+    )
+    await processar_lote_historico_whatsapp(context.bot, limite=5)
 
 
 # ============================================================
@@ -2227,6 +2318,13 @@ def main():
         CommandHandler(
             "status",
             comando_status,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "whatsapp_lote",
+            comando_whatsapp_lote,
         )
     )
 
