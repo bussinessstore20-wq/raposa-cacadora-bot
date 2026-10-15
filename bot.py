@@ -857,7 +857,7 @@ def montar_mensagem(
 # ENCAMINHAMENTO OPCIONAL PARA O CANAL WHATSAPP (WAHA)
 # ============================================================
 
-async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, link_afiliado: str, *, historico: bool = False) -> bool:
+async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, link_afiliado: str, *, historico: bool = False, produto_fila_id: int | None = None) -> bool:
     """Encaminha ao WhatsApp o mesmo texto publicado no Telegram, sem anexar foto."""
     if not historico and not WHATSAPP_FORWARD_ENABLED:
         return False
@@ -877,32 +877,62 @@ async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, 
 
     def _enviar():
         headers = {"X-Api-Key": WAHA_API_KEY, "Content-Type": "application/json", "Accept": "application/json"}
-        # Sempre texto puro: não envia imagem nem gera prévia visual do link.
         payload = {
             "session": "default",
             "chatId": WAHA_CHANNEL_ID,
             "text": texto,
             "linkPreview": True,
         }
-        resposta = requests.post(
-            f"{WAHA_URL}/api/sendText",
-            headers=headers,
-            json=payload,
-            timeout=25,
-        )
-        resposta.raise_for_status()
-        try:
-            dados = resposta.json()
-        except Exception:
-            dados = {}
-        return resposta.status_code, str(dados.get("id") or dados.get("messageId") or "")
+        ultima_excecao = None
+        for tentativa in range(1, 4):
+            try:
+                resposta = requests.post(
+                    f"{WAHA_URL}/api/sendText",
+                    headers=headers,
+                    json=payload,
+                    timeout=25,
+                )
+                resposta.raise_for_status()
+                try:
+                    dados = resposta.json()
+                except Exception:
+                    dados = {}
+                return resposta.status_code, str(dados.get("id") or dados.get("messageId") or "")
+            except requests.RequestException as erro:
+                ultima_excecao = erro
+                status = getattr(getattr(erro, "response", None), "status_code", None)
+                # Erros de sessão/configuração (4xx, exceto 408/429) não melhoram com repetição.
+                if status is not None and 400 <= status < 500 and status not in (408, 429):
+                    raise
+                if tentativa < 3:
+                    espera = (2, 5)[tentativa - 1]
+                    logger.warning("Falha temporária WAHA no envio (tentativa %s/3; HTTP %s). Nova tentativa em %ss.", tentativa, status or "sem resposta", espera)
+                    import time
+                    time.sleep(espera)
+        raise ultima_excecao
 
     try:
         status_code, message_id = await asyncio.to_thread(_enviar)
         logger.info("Texto da oferta encaminhado ao WhatsApp sem imagem (HTTP %s).", status_code)
+        if produto_fila_id is not None and supabase is not None:
+            try:
+                await asyncio.to_thread(lambda: supabase.table("whatsapp_backfill_log").upsert(
+                    {"produto_fila_id": produto_fila_id, "channel_id": WAHA_CHANNEL_ID, "status": "sent", "whatsapp_message_id": message_id, "error": None, "sent_at": datetime.now(timezone.utc).isoformat()},
+                    on_conflict="produto_fila_id"
+                ).execute())
+            except Exception:
+                logger.exception("WhatsApp enviado, mas não foi possível registrar confirmação do produto #%s.", produto_fila_id)
         return {"status_code": status_code, "message_id": message_id}
-    except Exception:
-        logger.exception("Falha ao encaminhar oferta ao WhatsApp.")
+    except Exception as erro:
+        logger.exception("Falha ao encaminhar oferta ao WhatsApp após tentativas automáticas.")
+        if produto_fila_id is not None and supabase is not None:
+            try:
+                await asyncio.to_thread(lambda: supabase.table("whatsapp_backfill_log").upsert(
+                    {"produto_fila_id": produto_fila_id, "channel_id": WAHA_CHANNEL_ID, "status": "error", "error": str(erro)[:1000]},
+                    on_conflict="produto_fila_id"
+                ).execute())
+            except Exception:
+                logger.exception("Não foi possível registrar a falha do WhatsApp para o produto #%s.", produto_fila_id)
         return False
 
 
@@ -1101,7 +1131,9 @@ async def publicar_produto(
                 "Produto publicado com imagem e botão."
             )
 
-            await encaminhar_para_whatsapp(produto, mensagem, link_afiliado)
+            resultado_whatsapp = await encaminhar_para_whatsapp(produto, mensagem, link_afiliado, produto_fila_id=produto.get("_fila_id"))
+            if not resultado_whatsapp:
+                await enviar_notificacao_admin(bot, f"⚠️ <b>WHATSAPP NÃO CONFIRMADO</b>\n\nOferta #{produto.get('_fila_id', '?')} publicada no Telegram, mas o envio ao WhatsApp falhou após 3 tentativas. A falha foi registrada para conferência. Verifique se a sessão WAHA está ativa.")
 
             return (
                 True,
@@ -1131,7 +1163,9 @@ async def publicar_produto(
             "Produto publicado somente como texto."
         )
 
-        await encaminhar_para_whatsapp(produto, mensagem, link_afiliado)
+        resultado_whatsapp = await encaminhar_para_whatsapp(produto, mensagem, link_afiliado, produto_fila_id=produto.get("_fila_id"))
+        if not resultado_whatsapp:
+            await enviar_notificacao_admin(bot, f"⚠️ <b>WHATSAPP NÃO CONFIRMADO</b>\n\nOferta #{produto.get('_fila_id', '?')} publicada no Telegram, mas o envio ao WhatsApp falhou após 3 tentativas. A falha foi registrada para conferência. Verifique se a sessão WAHA está ativa.")
 
         return (
             True,
@@ -1266,6 +1300,7 @@ async def processar_produto(
             )
 
         produto["marketplace"] = marketplace
+        produto["_fila_id"] = produto_id
 
         # Se o STOP foi acionado enquanto consultávamos o marketplace,
         # devolve o item à fila em vez de publicar depois da pausa.
