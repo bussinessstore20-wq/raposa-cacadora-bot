@@ -858,7 +858,7 @@ def montar_mensagem(
 # ============================================================
 
 async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, link_afiliado: str, *, historico: bool = False) -> bool:
-    """Encaminha a oferta ao canal WhatsApp sem publicar novamente no Telegram."""
+    """Encaminha ao WhatsApp o mesmo texto publicado no Telegram, sem anexar foto."""
     if not historico and not WHATSAPP_FORWARD_ENABLED:
         return False
     if not WAHA_API_KEY or not WAHA_CHANNEL_ID:
@@ -868,42 +868,28 @@ async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, 
     import re
     from html import unescape
 
+    # Remove apenas a marcação HTML do Telegram; mantém texto, emojis e quebras.
     texto = unescape(re.sub(r"<[^>]+>", "", mensagem_html or "")).strip()
     if link_afiliado:
-        texto = f"{texto}\n\n🛒 COMPRAR AGORA: {link_afiliado}"
-
-    image_url = str(produto.get("imageUrl") or "").strip()
-    if WAHA_TEXT_ONLY_PREVIEW:
-        image_url = ""  # Testa a prévia automática do link, sem anexar imagem.
+        # Evita duplicar a URL se ela já estiver presente no corpo da mensagem.
+        if link_afiliado not in texto:
+            texto = f"{texto}\\n\\n🛒 COMPRAR AGORA: {link_afiliado}"
 
     def _enviar():
         headers = {"X-Api-Key": WAHA_API_KEY, "Content-Type": "application/json", "Accept": "application/json"}
-        endpoint = f"{WAHA_URL}/api/sendImage" if image_url else f"{WAHA_URL}/api/sendText"
-        payload = {"session": "default", "chatId": WAHA_CHANNEL_ID}
-        if image_url:
-            payload.update({
-                "file": {"url": image_url, "mimetype": "image/jpeg", "filename": "oferta.jpg"},
-                "caption": texto,
-            })
-        else:
-            payload["text"] = texto
-            if WAHA_TEXT_ONLY_PREVIEW:
-                payload["linkPreview"] = True
-
-        resposta = requests.post(endpoint, headers=headers, json=payload, timeout=25)
-        if not resposta.ok and image_url:
-            # Em 5xx, o WAHA provavelmente está indisponível ou sem recursos.
-            # Não fazer uma segunda chamada imediatamente evita agravar a falha.
-            if resposta.status_code >= 500:
-                logger.error("WAHA indisponível ao enviar imagem (HTTP %s); não tentarei texto enquanto o serviço estiver com erro 5xx.", resposta.status_code)
-                resposta.raise_for_status()
-            logger.warning("WAHA recusou imagem (%s); tentando encaminhar apenas texto.", resposta.status_code)
-            resposta = requests.post(
-                f"{WAHA_URL}/api/sendText",
-                headers=headers,
-                json={"session": "default", "chatId": WAHA_CHANNEL_ID, "text": texto, "linkPreview": True},
-                timeout=25,
-            )
+        # Sempre texto puro: não envia imagem nem gera prévia visual do link.
+        payload = {
+            "session": "default",
+            "chatId": WAHA_CHANNEL_ID,
+            "text": texto,
+            "linkPreview": False,
+        }
+        resposta = requests.post(
+            f"{WAHA_URL}/api/sendText",
+            headers=headers,
+            json=payload,
+            timeout=25,
+        )
         resposta.raise_for_status()
         try:
             dados = resposta.json()
@@ -913,7 +899,7 @@ async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, 
 
     try:
         status_code, message_id = await asyncio.to_thread(_enviar)
-        logger.info("Oferta encaminhada ao canal WhatsApp via WAHA (HTTP %s).", status_code)
+        logger.info("Texto da oferta encaminhado ao WhatsApp sem imagem (HTTP %s).", status_code)
         return {"status_code": status_code, "message_id": message_id}
     except Exception:
         logger.exception("Falha ao encaminhar oferta ao WhatsApp.")
