@@ -873,7 +873,7 @@ async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, 
     if link_afiliado:
         # Evita duplicar a URL se ela já estiver presente no corpo da mensagem.
         if link_afiliado not in texto:
-            texto = f"{texto}\\n\\n🛒 COMPRAR AGORA: {link_afiliado}"
+            texto = f"{texto}\n\n🛒 COMPRAR AGORA: {link_afiliado}"
 
     def _enviar():
         headers = {"X-Api-Key": WAHA_API_KEY, "Content-Type": "application/json", "Accept": "application/json"}
