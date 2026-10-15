@@ -2189,6 +2189,12 @@ async def worker_fila(
 
                 continue
 
+            # O lote histórico pode ter sido iniciado enquanto a consulta
+            # ao Supabase estava aguardando; não comece um produto novo nesse caso.
+            if whatsapp_backfill_task is not None and not whatsapp_backfill_task.done():
+                await asyncio.sleep(1)
+                continue
+
             # ------------------------------------------------
             # Processar
             # ------------------------------------------------
