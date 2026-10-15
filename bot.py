@@ -150,6 +150,7 @@ worker_task: asyncio.Task | None = None
 # Controle independente do lote histórico do WhatsApp.
 whatsapp_backfill_task: asyncio.Task | None = None
 whatsapp_backfill_stop_requested = False
+normal_product_in_progress = False
 
 
 # ============================================================
@@ -916,9 +917,16 @@ async def encaminhar_para_whatsapp(produto: dict[str, Any], mensagem_html: str, 
 
 async def processar_lote_historico_whatsapp(bot: Bot, limite: int = 5):
     """Envia ofertas já publicadas no Telegram ao WhatsApp, com imagem e pausa controlável."""
-    global whatsapp_backfill_stop_requested
+    global whatsapp_backfill_stop_requested, normal_product_in_progress
 
     import gc
+
+    # Aguarda terminar qualquer produto novo iniciado antes do lote histórico.
+    while normal_product_in_progress and not whatsapp_backfill_stop_requested:
+        await asyncio.sleep(1)
+    if whatsapp_backfill_stop_requested:
+        await enviar_notificacao_admin(bot, "⏹️ Lote histórico cancelado antes de iniciar.")
+        return
 
     if supabase is None:
         await enviar_notificacao_admin(bot, "❌ Supabase não está conectado.")
@@ -1388,19 +1396,17 @@ async def processar_produto(
 def teclado_controle():
 
     return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "▶️ INICIAR",
-                    callback_data="bot_iniciar",
-                ),
-                InlineKeyboardButton(
-                    "⏹️ STOP",
-                    callback_data="bot_stop",
-                ),
-            ],
-        ]
+        [[
+            InlineKeyboardButton("▶️ INICIAR FILA NOVA", callback_data="bot_iniciar"),
+            InlineKeyboardButton("⏹️ STOP FILA NOVA", callback_data="bot_stop"),
+        ]]
     )
+
+
+def teclado_lote_historico():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏹️ STOP LOTES ANTIGOS", callback_data="whatsapp_lote_stop")
+    ]])
 
 
 # ============================================================
@@ -1454,17 +1460,17 @@ async def comando_whatsapp_lote(update: Update, context: ContextTypes.DEFAULT_TY
         return
     if whatsapp_backfill_task is not None and not whatsapp_backfill_task.done():
         await update.message.reply_text(
-            "⏳ Já existe um lote histórico em execução. Use o botão STOP para interrompê-lo antes de iniciar outro.",
+            "⏳ Já existe um lote histórico em execução. Use STOP LOTES ANTIGOS para pará-lo; a fila nova tem controle separado.",
             parse_mode=ParseMode.HTML,
-            reply_markup=teclado_controle(),
+            reply_markup=teclado_lote_historico(),
         )
         return
 
     whatsapp_backfill_stop_requested = False
     await update.message.reply_text(
-        "📦 Lote histórico iniciado: até 5 ofertas antigas serão enviadas ao WhatsApp COM IMAGEM quando disponível, com pausa de 30 segundos entre envios. O botão STOP interrompe o lote antes da próxima oferta; novos links continuam sendo recebidos.",
+        "📦 Lote histórico iniciado: até 5 ofertas antigas serão enviadas ao WhatsApp COM IMAGEM quando disponível, com pausa de 30 segundos entre envios.\n\n⏹️ Use STOP LOTES ANTIGOS para parar somente este lote. A fila nova tem STOP separado; links novos ficam aguardando até o histórico terminar.",
         parse_mode=ParseMode.HTML,
-        reply_markup=teclado_controle(),
+        reply_markup=teclado_lote_historico(),
     )
     whatsapp_backfill_task = asyncio.create_task(
         processar_lote_historico_whatsapp(context.bot, limite=5)
@@ -1852,22 +1858,17 @@ async def comando_stop(
         return
 
     bot_ativo = False
-    whatsapp_backfill_stop_requested = True
 
-    logger.warning(
-        "STOP acionado: publicação normal pausada e lote histórico do WhatsApp será interrompido."
-    )
+    logger.warning("STOP da fila nova acionado; o lote histórico não foi alterado.")
 
     await update.message.reply_text(
         (
             "⏹️ <b>PUBLICAÇÃO PARADA</b>\n"
             "\n"
-            "Nenhum novo produto será publicado.\n"
-            "Os produtos que já estão no Supabase "
-            "continuam na fila.\n"
-            "\n"
-            "▶️ Use /iniciar ou o botão INICIAR "
-            "para continuar."
+            "Somente a fila de novos links foi pausada.\n"
+            "Os produtos permanecem salvos no Supabase.\n"
+            "O lote de links antigos no WhatsApp não é afetado.\n\n"
+            "▶️ Use /iniciar ou INICIAR FILA NOVA para continuar."
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=teclado_controle(),
@@ -1935,23 +1936,28 @@ async def callback_controle(
 
     await query.answer()
 
-    if query.data == "bot_stop":
+    if query.data == "whatsapp_lote_stop":
+
+        whatsapp_backfill_stop_requested = True
+        logger.warning("STOP exclusivo do lote histórico acionado; fila nova não foi alterada.")
+        texto = (
+            "⏹️ <b>LOTE DE LINKS ANTIGOS PARANDO</b>\n\n"
+            "Somente o lote histórico do WhatsApp foi sinalizado para parar. "
+            "A fila de novos links continua no estado em que estava."
+        )
+        teclado_resposta = teclado_lote_historico()
+
+    elif query.data == "bot_stop":
 
         bot_ativo = False
-        whatsapp_backfill_stop_requested = True
-
-        logger.warning(
-            "Botão STOP acionado: fila normal pausada e lote histórico WhatsApp sinalizado para parar."
-        )
-
+        logger.warning("STOP exclusivo da fila nova acionado; lote histórico não foi alterado.")
         texto = (
-            "⏹️ <b>PUBLICAÇÃO PAUSADA</b>\n"
-            "\n"
-            "A fila permanece salva no Supabase.\n"
-            "O lote WhatsApp também foi sinalizado para parar; um envio já iniciado pode terminar.\n"
-            "\n"
-            "▶️ Pressione INICIAR para retomar a fila. Para iniciar um novo lote histórico, use /whatsapp_lote."
+            "⏹️ <b>FILA DE NOVOS LINKS PAUSADA</b>\n\n"
+            "Os novos produtos permanecem salvos no Supabase. "
+            "O lote de links antigos no WhatsApp não foi afetado.\n\n"
+            "▶️ Use INICIAR FILA NOVA para retomar."
         )
+        teclado_resposta = teclado_controle()
 
     elif query.data == "bot_iniciar":
 
@@ -1962,12 +1968,13 @@ async def callback_controle(
         )
 
         texto = (
-            "▶️ <b>PUBLICAÇÃO INICIADA</b>\n"
+            "▶️ <b>FILA DE NOVOS LINKS INICIADA</b>\n"
             "\n"
-            "A Raposa voltou a processar a fila.\n"
-            "\n"
+            "A Raposa voltou a processar a fila nova.\n"
+            "O lote histórico do WhatsApp não foi alterado.\n\n"
             f"⏱️ Intervalo: <b>{INTERVALO_MINUTOS} minutos</b>"
         )
+        teclado_resposta = teclado_controle()
 
     else:
 
@@ -1978,7 +1985,7 @@ async def callback_controle(
         await query.edit_message_text(
             texto,
             parse_mode=ParseMode.HTML,
-            reply_markup=teclado_controle(),
+            reply_markup=teclado_resposta,
         )
 
     except Exception:
@@ -1990,7 +1997,7 @@ async def callback_controle(
                 await query.message.reply_text(
                     texto,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=teclado_controle(),
+                    reply_markup=teclado_resposta,
                 )
 
         except Exception:
@@ -2131,7 +2138,7 @@ async def worker_fila(
     bot: Bot,
 ):
 
-    global bot_ativo
+    global bot_ativo, whatsapp_backfill_task, normal_product_in_progress
 
     logger.info(
         "Worker da fila iniciado."
@@ -2142,13 +2149,17 @@ async def worker_fila(
         try:
 
             # ------------------------------------------------
-            # STOP
+            # Controles independentes
             # ------------------------------------------------
 
             if not bot_ativo:
-
                 await asyncio.sleep(2)
+                continue
 
+            # Enquanto o lote histórico roda, novos links podem ser recebidos
+            # e salvos, mas a fila nova não processa produtos.
+            if whatsapp_backfill_task is not None and not whatsapp_backfill_task.done():
+                await asyncio.sleep(1)
                 continue
 
             # ------------------------------------------------
@@ -2182,10 +2193,14 @@ async def worker_fila(
             # Processar
             # ------------------------------------------------
 
-            sucesso = await processar_produto(
-                bot=bot,
-                produto_fila=produto,
-            )
+            normal_product_in_progress = True
+            try:
+                sucesso = await processar_produto(
+                    bot=bot,
+                    produto_fila=produto,
+                )
+            finally:
+                normal_product_in_progress = False
 
             # ------------------------------------------------
             # STOP pode ter sido acionado
