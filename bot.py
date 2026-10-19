@@ -31,6 +31,11 @@ from shopee import (
     ShopeeAPIError,
 )
 
+
+# Pipeline temporária para processamento manual de carrosséis Instagram.
+import instagram_pipeline as instagram_pipeline
+from manus import detalhar_tarefa, enviar_mensagem_tarefa
+
 from mercadolivre import (
     buscar_produto_por_link as buscar_produto_mercadolivre,
     MercadoLivreAPIError,
@@ -2530,6 +2535,179 @@ async def post_shutdown(
     )
 
 
+
+
+# ============================================================
+# LOTE INSTAGRAM TEMPORÁRIO — SOMENTE SOB COMANDO ADMINISTRATIVO
+# ============================================================
+
+INSTAGRAM_TEMP_BOT_ID = os.getenv("BOT_ID", "raposa-cacadora").strip()
+lote24_poll_task = None
+
+async def _acompanhar_tarefa_manus(post_id: int, task_id: str, bot: Bot):
+    """Consulta o Manus sem depender do webhook da conta Render suspensa."""
+    import time
+    limite = time.monotonic() + 60 * 60
+    ultimo_status = ""
+    while time.monotonic() < limite:
+        try:
+            data = await asyncio.to_thread(detalhar_tarefa, task_id)
+            task = data.get("task") or {}
+            status = str(task.get("status") or "").strip().lower()
+            stop_reason = str(task.get("stop_reason") or "").strip().lower()
+            if status != ultimo_status:
+                logger.info("Lote Instagram #%s: tarefa Manus status=%s stop_reason=%s", post_id, status, stop_reason)
+                ultimo_status = status
+            if status in {"stopped", "completed", "finished", "done"} or stop_reason:
+                ok, mensagem = await asyncio.to_thread(
+                    instagram_pipeline.processar_webhook_manus,
+                    supabase,
+                    {"event_type": "task_stopped", "task_detail": task},
+                )
+                logger.info("Resultado Manus lote #%s: ok=%s mensagem=%s", post_id, ok, mensagem)
+                await enviar_notificacao_admin(
+                    bot,
+                    f"🦊 <b>LOTE #{post_id} — RETORNO DO MANUS</b>\n\n{mensagem}\n\nConfira a prévia no Telegram antes de aprovar.",
+                )
+                return
+        except Exception:
+            logger.exception("Falha ao consultar tarefa Manus do lote #%s; nova tentativa em 15s.", post_id)
+        await asyncio.sleep(15)
+    await enviar_notificacao_admin(
+        bot,
+        f"⚠️ <b>LOTE #{post_id}</b>\n\nO acompanhamento automático atingiu 60 minutos. A tarefa Manus pode continuar ativa; confira o painel do Manus antes de iniciar novamente.",
+    )
+
+async def comando_lote24(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global lote24_poll_task
+    if not usuario_autorizado(update):
+        return
+    if update.message is None:
+        return
+    if supabase is None:
+        await update.message.reply_text("❌ Supabase não está conectado. Não iniciei o lote.")
+        return
+    try:
+        post_rows = await asyncio.to_thread(
+            lambda: supabase.table("instagram_posts")
+                .select("id,status,bot_id,manus_task_id")
+                .eq("id", 24)
+                .eq("bot_id", INSTAGRAM_TEMP_BOT_ID)
+                .limit(1).execute().data or []
+        )
+        if not post_rows:
+            await update.message.reply_text(
+                f"❌ Lote #24 não encontrado para bot_id={INSTAGRAM_TEMP_BOT_ID}. Confira BOT_ID no Render."
+            )
+            return
+        post = post_rows[0]
+        status = str(post.get("status") or "").lower()
+        if status != "pending":
+            await update.message.reply_text(
+                f"⚠️ Lote #24 está com status <b>{status}</b>, não pending. Não vou criar outra tarefa Manus nem duplicar processamento.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if lote24_poll_task is not None and not lote24_poll_task.done():
+            await update.message.reply_text("⏳ Já existe um acompanhamento de tarefa Manus em execução.")
+            return
+        iniciou = await asyncio.to_thread(
+            instagram_pipeline.processar_lote_se_pronto,
+            supabase,
+            24,
+        )
+        if not iniciou:
+            atual = await asyncio.to_thread(
+                lambda: supabase.table("instagram_posts")
+                    .select("status,error")
+                    .eq("id", 24).eq("bot_id", INSTAGRAM_TEMP_BOT_ID)
+                    .limit(1).execute().data or []
+            )
+            detalhes = atual[0] if atual else {}
+            await update.message.reply_text(
+                f"❌ Não consegui iniciar o lote #24. Status: {detalhes.get('status','desconhecido')}. Erro: {str(detalhes.get('error') or 'verifique os logs')[:700]}"
+            )
+            return
+        atualizado = await asyncio.to_thread(
+            lambda: supabase.table("instagram_posts")
+                .select("manus_task_id,status")
+                .eq("id", 24).eq("bot_id", INSTAGRAM_TEMP_BOT_ID)
+                .limit(1).execute().data or []
+        )
+        task_id = str((atualizado[0] if atualizado else {}).get("manus_task_id") or "").strip()
+        if not task_id:
+            await update.message.reply_text("⚠️ O lote foi reservado, mas o Manus não retornou task_id. Confira o status do lote no Supabase antes de tentar novamente.")
+            return
+        lote24_poll_task = asyncio.create_task(_acompanhar_tarefa_manus(24, task_id, context.bot))
+        await update.message.reply_text(
+            f"✅ Lote #24 enviado ao Manus.\n\n🆔 Tarefa: <code>{task_id}</code>\n⏳ Vou acompanhar o processamento e enviar a prévia para sua aprovação no Telegram.\n\n🚫 Nenhuma publicação será feita sem sua aprovação.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as erro:
+        logger.exception("Falha ao iniciar lote Instagram #24")
+        await update.message.reply_text(f"❌ Falha ao iniciar lote #24: {str(erro)[:900]}")
+
+async def callback_carrossel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None:
+        return
+    if not usuario_autorizado(update):
+        await query.answer("Você não está autorizado.", show_alert=True)
+        return
+    try:
+        acao, raw_post_id = query.data.split(":", 1)
+        post_id = int(raw_post_id)
+    except Exception:
+        await query.answer("Botão inválido.", show_alert=True)
+        return
+    if supabase is None:
+        await query.answer("Supabase não está conectado.", show_alert=True)
+        return
+    try:
+        rows = await asyncio.to_thread(
+            lambda: supabase.table("instagram_posts")
+                .select("id,manus_task_id,status,bot_id")
+                .eq("id", post_id).eq("bot_id", INSTAGRAM_TEMP_BOT_ID)
+                .limit(1).execute().data or []
+        )
+        if not rows:
+            await query.answer("Carrossel não encontrado.", show_alert=True)
+            return
+        post = rows[0]
+        task_id = str(post.get("manus_task_id") or "").strip()
+        status = str(post.get("status") or "").lower()
+        if not task_id:
+            await query.answer("Tarefa Manus não vinculada.", show_alert=True)
+            return
+        if status in {"approved", "rejected", "published"}:
+            await query.answer(f"Já está com status {status}.", show_alert=True)
+            return
+        aprovado = acao == "carousel_approve"
+        instrucao = (
+            f"O carrossel #{post_id} foi APROVADO pelo administrador no Telegram. Continue o fluxo e publique no Instagram conforme as instruções originais."
+            if aprovado else
+            f"O carrossel #{post_id} foi REPROVADO pelo administrador no Telegram. Não publique este carrossel. Encerre o fluxo."
+        )
+        await asyncio.to_thread(enviar_mensagem_tarefa, task_id, instrucao)
+        await asyncio.to_thread(
+            lambda: supabase.table("instagram_posts")
+                .update({"status": "approved" if aprovado else "rejected", "updated_at": datetime.now(timezone.utc).isoformat()})
+                .eq("id", post_id).eq("bot_id", INSTAGRAM_TEMP_BOT_ID).execute()
+        )
+        await query.answer("Decisão registrada.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        if query.message:
+            await query.message.reply_text(
+                f"🦊 Carrossel #{post_id}: {'APROVADO' if aprovado else 'REPROVADO'}. {'O Manus continuará o fluxo.' if aprovado else 'O Manus foi instruído a não publicar.'}"
+            )
+    except Exception as erro:
+        logger.exception("Erro na decisão do carrossel #%s", post_id)
+        await query.answer(f"Falha ao registrar decisão: {str(erro)[:150]}", show_alert=True)
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -2580,6 +2758,9 @@ def main():
     # --------------------------------------------------------
     # COMANDOS
     # --------------------------------------------------------
+
+    application.add_handler(CommandHandler("lote24", comando_lote24))
+    application.add_handler(CallbackQueryHandler(callback_carrossel, pattern=r"^carousel_(approve|reject):"))
 
     application.add_handler(
         CommandHandler(
