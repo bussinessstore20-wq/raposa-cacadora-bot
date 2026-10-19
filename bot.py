@@ -2499,6 +2499,11 @@ async def post_init(
         application
     )
 
+    # Inicialização temporária e restrita ao lote histórico #24.
+    if os.getenv("INSTAGRAM_BATCH24_AUTOSTART", "false").strip().lower() in {"1", "true", "yes", "on"}:
+        asyncio.create_task(_iniciar_lote24_automatico(application.bot))
+
+
 
 # ============================================================
 # POST SHUTDOWN
@@ -2577,6 +2582,49 @@ async def _acompanhar_tarefa_manus(post_id: int, task_id: str, bot: Bot):
         bot,
         f"⚠️ <b>LOTE #{post_id}</b>\n\nO acompanhamento automático atingiu 60 minutos. A tarefa Manus pode continuar ativa; confira o painel do Manus antes de iniciar novamente.",
     )
+
+
+async def _iniciar_lote24_automatico(bot: Bot):
+    """Inicia apenas o lote #24 uma vez, mantendo aprovação manual antes da publicação."""
+    global lote24_poll_task
+    if supabase is None:
+        logger.error("Autostart lote #24 abortado: Supabase desconectado.")
+        return
+    try:
+        rows = await asyncio.to_thread(
+            lambda: supabase.table("instagram_posts")
+                .select("id,status,bot_id,manus_task_id")
+                .eq("id", 24).eq("bot_id", INSTAGRAM_TEMP_BOT_ID)
+                .limit(1).execute().data or []
+        )
+        if not rows:
+            logger.error("Autostart lote #24 abortado: registro não encontrado para bot_id=%s.", INSTAGRAM_TEMP_BOT_ID)
+            return
+        post=rows[0]
+        if str(post.get("status") or "").lower() != "pending":
+            logger.info("Autostart lote #24 ignorado: status atual=%s; nenhum novo task será criado.", post.get("status"))
+            return
+        if lote24_poll_task is not None and not lote24_poll_task.done():
+            logger.info("Autostart lote #24 ignorado: acompanhamento já em execução.")
+            return
+        iniciou = await asyncio.to_thread(instagram_pipeline.processar_lote_se_pronto, supabase, 24)
+        rows_atual = await asyncio.to_thread(
+            lambda: supabase.table("instagram_posts")
+                .select("status,error,manus_task_id")
+                .eq("id", 24).eq("bot_id", INSTAGRAM_TEMP_BOT_ID)
+                .limit(1).execute().data or []
+        )
+        atual=rows_atual[0] if rows_atual else {}
+        task_id=str(atual.get("manus_task_id") or "").strip()
+        if not iniciou or not task_id:
+            logger.error("Autostart lote #24 não criou tarefa Manus. status=%s erro=%s", atual.get("status"), atual.get("error"))
+            await enviar_notificacao_admin(bot, f"❌ <b>LOTE #24 NÃO INICIADO</b>\n\n{str(atual.get('error') or 'Confira os logs do serviço.')[:800]}")
+            return
+        lote24_poll_task=asyncio.create_task(_acompanhar_tarefa_manus(24, task_id, bot))
+        logger.info("Autostart: lote #24 enviado ao Manus, task_id=%s; aguardando resultado e aprovação.", task_id)
+        await enviar_notificacao_admin(bot, f"🦊 <b>LOTE #24 ENVIADO AO MANUS</b>\n\n🆔 Tarefa: <code>{task_id}</code>\nAcompanharei o processamento e enviarei a prévia para aprovação. Nenhuma publicação será feita sem aprovação.")
+    except Exception:
+        logger.exception("Falha no autostart do lote #24.")
 
 async def comando_lote24(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global lote24_poll_task
